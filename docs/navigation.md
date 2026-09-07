@@ -122,9 +122,14 @@ other agent layouts may not provide those highlights.
   panels without color.
 - **Codex itself stopped animating:** Tmuxius does not set Codex's `tui.animations`
   option. If you previously disabled it in your own Codex configuration, remove
-  that override and restart Codex when convenient. This is independent of the
-  dashboard's `--interval`, which defaults to 0.5 seconds. tmux's `status-interval`
-  controls its status bar, not how often application output is delivered.
+  that override and restart **Codex itself** when convenient. Reopening only the
+  dashboard does not reload a running agent's settings. A local 30-second check
+  with Codex 0.153.4 reproduced a stationary Working timer with animations off
+  and one-second increments with animations on, without new response text.
+  OpenAI documents animations as [enabled by default](https://learn.chatgpt.com/docs/config-file/config-reference).
+  This is independent of the dashboard's `--interval`, which defaults to 0.5
+  seconds. tmux's `status-interval` controls its status bar, not how often
+  application output is delivered.
 - **Less history than expected:** tmux can only return retained scrollback.
   Set its `history-limit` before starting panes if you need more. Use
   `--history-lines` to bound work on very large histories.

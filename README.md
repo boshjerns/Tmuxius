@@ -75,6 +75,11 @@ For a different location, use `PREFIX=/your/prefix ./install.sh`.
 Tmuxius does not disable agent animations or throttle the original terminal.
 Its own selected-panel refresh defaults to twice per second, including changing
 Working timers; unchanged frames reuse cached parsing to keep scrolling light.
+That interval controls how often Tmuxius reads the pane. The agent must also
+redraw its timer: disabling Codex's `tui.animations` can leave Working unchanged
+until another event occurs. Restore Codex's default animations and restart the
+Codex process itself if you previously disabled them; reopening only Tmuxius
+does not reload Codex's configuration.
 
 If you run it inside a separate tmux session called `monitor`, you can optionally
 enable mouse support for just that session, then restore its exact prior setting:
