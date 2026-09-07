@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""Opt into tmux mouse support for one session, or restore its prior setting."""
+
+import argparse
+import json
+import subprocess
+import sys
+
+SAVED = "@tmuxius_previous_mouse"
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=("on", "off", "status"))
+    parser.add_argument("--target", required=True, help="exact tmux session name or ID")
+    parser.add_argument("--socket", help="tmux socket path (default: current user's server)")
+    args = parser.parse_args()
+    command = ["tmux"] + (["-S", args.socket] if args.socket else [])
+
+    def tmux(*arguments):
+        result = subprocess.run(command + list(arguments), capture_output=True, text=True, timeout=3)
+        if result.returncode:
+            raise RuntimeError(result.stderr.strip() or "tmux command failed")
+        return result.stdout.rstrip("\n")
+
+    # Exact matching prevents a short session name from changing another session.
+    sessions = [line.split("\t", 1) for line in
+                tmux("list-sessions", "-F", "#{session_id}\t#{session_name}").splitlines()]
+    target = next((item[0] for item in sessions if args.target == item[0]), None)
+    if target is None:
+        target = next((item[0] for item in sessions if len(item) == 2 and args.target == item[1]), None)
+    if target is None:
+        raise RuntimeError("no exact session matches the requested target")
+    options = tmux("show-options", "-t", target)
+    local_mouse = next((line.split(" ", 1)[1] for line in options.splitlines()
+                        if line.startswith("mouse ")), None)
+    saved = tmux("show-options", "-qv", "-t", target, SAVED)
+    if args.action == "status":
+        effective = tmux("show-options", "-Av", "-t", target, "mouse")
+        print(f"mouse={effective}; Tmuxius toggle={'on' if saved else 'off'}")
+    elif args.action == "on":
+        if not saved:
+            tmux("set-option", "-t", target, SAVED, json.dumps({"mouse": local_mouse}))
+        tmux("set-option", "-t", target, "mouse", "on")
+        print("Mouse support enabled for this session only; prior setting saved.")
+    elif saved:
+        previous = json.loads(saved)
+        if set(previous) != {"mouse"} or previous["mouse"] not in {None, "on", "off"}:
+            raise RuntimeError("saved mouse setting is invalid; nothing changed")
+        if previous["mouse"] is None:
+            tmux("set-option", "-u", "-t", target, "mouse")
+        else:
+            tmux("set-option", "-t", target, "mouse", previous["mouse"])
+        tmux("set-option", "-u", "-t", target, SAVED)
+        print("Restored this session's previous mouse setting.")
+    else:
+        print("No Tmuxius mouse override to undo; nothing changed.")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+        print(f"tmuxius-mouse: {exc}", file=sys.stderr)
+        raise SystemExit(1)

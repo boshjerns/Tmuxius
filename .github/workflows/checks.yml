@@ -1,0 +1,51 @@
+name: Checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.10', '3.12', '3.14']
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Check source and terminal behavior
+        run: |
+          ./tmuxius --self-test
+          python3 -m unittest discover -s tests -v
+          python3 scripts/check-publication.py
+      - name: Check installation
+        run: |
+          PREFIX="$RUNNER_TEMP/tmuxius-prefix" ./install.sh
+          "$RUNNER_TEMP/tmuxius-prefix/bin/tmuxius" --self-test
+          "$RUNNER_TEMP/tmuxius-prefix/bin/tmuxius" --version
+
+  privacy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check publication manifest
+        run: python3 scripts/check-publication.py
+      - name: Install verified scanner
+        run: bash scripts/install-gitleaks-ci.sh
+      - name: Scan source and history
+        run: |
+          gitleaks dir --redact --no-banner .
+          gitleaks git --redact --no-banner .

@@ -1,0 +1,4715 @@
+#!/usr/bin/env python3
+"""Tmuxius: a compact terminal dashboard for agents in tmux."""
+
+from __future__ import annotations
+
+import argparse
+import curses
+import functools
+import hashlib
+import json
+import os
+import queue
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import textwrap
+import threading
+import time
+import unicodedata
+import uuid
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+
+
+ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+SGR_RE = re.compile(r"\x1b\[([0-9;:]*)m")
+CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+SPACE_RE = re.compile(r"\s+")
+SECRET_WORD_RE = re.compile(
+    r"(?i)(?:\b(?:api[-_ ]?key|authorization|bearer|client[-_ ]?secret|"
+    r"private[-_ ]?key|password|passwd|secret|token|mnemonic|seed phrase)\b|"
+    r"(?:^|[/ ])\.env(?:\b|/))"
+)
+SECRET_VALUE_RE = re.compile(
+    r"(?i)(?:\beyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b|"
+    r"\b(?:sk|pk)_(?:live|test)_[A-Za-z0-9]{12,}\b|\b[0-9a-f]{48,}\b|"
+    r"\b[A-Za-z0-9+/=_-]{64,}\b)"
+)
+ACTION_PREFIX_RE = re.compile(
+    r"(?i)^(?:ran|explored|edited|read|searched|waited|waiting|viewed|called|"
+    r"updated plan|context compacted|used|inspected|opened|found|listed|wrote|"
+    r"working|computing)\b"
+)
+PROMPT_PLACEHOLDER_RE = re.compile(
+    r"(?i)^(?:run /review|ask anything|explain this codebase|try [\"']?|"
+    r"type /|what would you like|implement\s+\{feature\}|"
+    r"fix a bug in @filename|write tests for @filename)"
+)
+PREVIEW_REFLOW_BOUNDARY_RE = re.compile(
+    r"^(?:[-*+]\s+|\d+[.)]\s+|#{1,6}\s+|>\s+|`{3}|~{3}|\|\s*|"
+    r"[┌┐└┘├┤┬┴┼│─━┄┈]|tab to queue message\b|esc to interrupt\b)",
+    re.IGNORECASE,
+)
+BUSY_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:[◦•]\s*)?(?:working|computing)\s*\([^\n)]*"
+    r"(?:esc to interrupt|press esc to cancel)[^\n)]*\)(?:\s*·[^\n]*)?"
+    r"|[✻✽✢·*]\s*[^\n()]{1,80}\([^\n)]*"
+    r"(?:esc to interrupt|press esc to cancel)[^\n)]*\)(?:\s*·[^\n]*)?"
+    r"|computing…|waiting for background terminal(?:…)?|running command(?:…)?"
+    r")\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+BUSY_DURATION_RE = re.compile(
+    r"(?i)\b(?:working|computing)\s*\(\s*"
+    r"(?:(\d+)h\s*)?(?:(\d+)m\s*)?(\d+)s\b"
+)
+BUSY_TICK_RE = re.compile(
+    r"(?i)\b(working|computing)\s*\([^)]*(?:esc to interrupt|press esc to cancel)[^)]*\)"
+)
+GREEN_ACTIVITY_SECONDS = 10 * 60
+READY_ACTIVITY_SECONDS = 30 * 60
+FINISHING_ACTIVITY_SECONDS = 60 * 60
+# Match Codex's own conservative per-message cap while keeping large pasted
+# payloads out of the editable/rendered string. Codex uses the same 1 Mi-char
+# ceiling and collapses pastes above 1,000 characters into an element.
+MAX_MESSAGE_CHARS = 1 << 20
+LARGE_PASTE_CHAR_THRESHOLD = 1_000
+PASTE_TOKEN_START = 0xF0000
+PASTE_TOKEN_END = 0xFFFFD
+PASTE_BURST_CHAR_INTERVAL_SECONDS = 0.008
+PASTE_BURST_IDLE_SECONDS = 0.060
+PASTE_ENTER_SUPPRESS_SECONDS = 0.120
+BRACKETED_PASTE_IDLE_SECONDS = 15.0
+BACKGROUND_REFRESH_SECONDS = 1.0
+DETAIL_REFRESH_SECONDS = 10.0
+BACKGROUND_HISTORY_LINES = 24
+DASHBOARD_FOCUS_LABELS = {
+    "window": " WINDOW ",
+    "nav": " SELECT ID ",
+    "compose": " MESSAGE ",
+}
+CAPTURED_COLOR_PAIR_START = 14
+_captured_color_pairs: dict[tuple[int, int], int] = {}
+_captured_next_color_pair = CAPTURED_COLOR_PAIR_START
+_captured_colors_enabled = False
+_captured_color_count = 0
+_captured_color_pair_count = 0
+_captured_default_background = -1
+SEP = "\t"
+THREAD_ID_RE = re.compile(
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$"
+)
+THREAD_ID_VALUE_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+VERSION = "0.1.0"
+CODEX_NAME_CACHE_OPTION = "@tmuxius_codex_name_cache"
+MAX_RETAINED_CODEX_NAMES = 64
+
+
+@dataclass(frozen=True)
+class Session:
+    session_id: str
+    name: str
+    attached: int
+    activity: int
+
+
+@dataclass(frozen=True)
+class Pane:
+    window_index: str
+    pane_index: str
+    pane_id: str
+    command: str
+    pid: int
+    window_name: str = ""
+    automatic_rename: bool = True
+    codex_name_cache: str = ""
+
+
+@dataclass(frozen=True)
+class CodexThreadDetails:
+    subject: str | None
+    last_activity: float | None
+    thread_id: str | None = None
+    current_name: str | None = None
+
+
+@dataclass(frozen=True)
+class Process:
+    pid: int
+    ppid: int
+    pgid: int
+    tpgid: int
+    command: str
+    args: str
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalStyle:
+    foreground: int | tuple[int, int, int] | None = None
+    background: int | tuple[int, int, int] | None = None
+    bold: bool = False
+    dim: bool = False
+    italic: bool = False
+    underline: bool = False
+    reverse: bool = False
+    strike: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class PreviewSpan:
+    start: int
+    end: int
+    style: TerminalStyle
+
+
+@dataclass(frozen=True)
+class PreviewLine:
+    text: str
+    kind: str
+    continuation: bool = False
+    spans: tuple[PreviewSpan, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class PreviewLayout:
+    source: tuple[PreviewLine, ...]
+    width: int
+    wrapped: tuple[PreviewLine, ...]
+
+
+@dataclass
+class DashboardState:
+    demo_mode: bool = False
+    focus: str = "compose"
+    text: str = ""
+    cursor: int = 0
+    selector: str = ""
+    selector_updated: float = 0.0
+    sending: bool = False
+    status: str = ""
+    status_kind: str = "dim"
+    status_until: float = 0.0
+    preview_scroll: dict[str, int] = field(default_factory=dict)
+    preview_layouts: dict[str, PreviewLayout] = field(default_factory=dict)
+    drafts: dict[str, str] = field(default_factory=dict)
+    draft_cursors: dict[str, int] = field(default_factory=dict)
+    draft_paste_payloads: dict[str, dict[str, str]] = field(default_factory=dict)
+    active_draft_session: str | None = None
+    paste_payloads: dict[str, str] = field(default_factory=dict)
+    next_paste_token: int = PASTE_TOKEN_START
+    paste_enter_suppress_until: float = 0.0
+    inflight_session: str | None = None
+    inflight_message: str = ""
+    inflight_draft: str = ""
+    inflight_paste_payloads: dict[str, str] = field(default_factory=dict)
+    split_view: bool = False
+    workspaces_collapsed: bool = False
+    active_slot: int = 0
+    selected_session_ids: list[str | None] = field(
+        default_factory=lambda: [None, None]
+    )
+
+
+@dataclass(frozen=True)
+class SendResult:
+    ok: bool
+    session_id: str
+    detail: str
+
+
+@dataclass(frozen=True)
+class PasteReadResult:
+    text: str
+    complete: bool = True
+    too_large: bool = False
+
+
+@dataclass(frozen=True)
+class DashboardPanelGeometry:
+    x: int
+    width: int
+    chat_top: int
+    chat_bottom: int
+    composer_top: int
+    composer_middle: int
+    composer_bottom: int
+
+
+@dataclass(frozen=True)
+class Workspace:
+    session: Session
+    pane_id: str
+    app: str
+    state: str
+    summary: str
+    last_activity: float | None
+    busy_seconds: int | None
+    preview: tuple[PreviewLine, ...]
+    signature: str = ""
+    window_title: str | None = None
+    preview_signature: str = ""
+
+
+class TmuxError(RuntimeError):
+    pass
+
+
+class Colors:
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+        self.bold = "\033[1m" if enabled else ""
+        self.dim = "\033[2m" if enabled else ""
+        self.cyan = "\033[36m" if enabled else ""
+        self.green = "\033[32m" if enabled else ""
+        self.yellow = "\033[33m" if enabled else ""
+        self.orange = "\033[38;5;208m" if enabled else ""
+        # Dark enough to read as complete/inactive without disappearing on the
+        # default black terminal background.
+        self.complete = "\033[38;5;238m" if enabled else ""
+        self.red = "\033[31m" if enabled else ""
+        self.busy_gradient = (
+            "\033[38;5;75m",
+            "\033[38;5;69m",
+            "\033[38;5;99m",
+            "\033[38;5;135m",
+        ) if enabled else ("",)
+        self.reset = "\033[0m" if enabled else ""
+
+    def busy(self, value: str) -> str:
+        """Render text blue-to-purple without changing its visible width."""
+        if not self.enabled:
+            return value
+        visible_length = len(value.rstrip())
+        if visible_length <= 1:
+            return f"{self.busy_gradient[0]}{value}{self.reset}"
+        rendered: list[str] = []
+        last_index = len(self.busy_gradient) - 1
+        for index, character in enumerate(value):
+            if index >= visible_length:
+                rendered.append(character)
+                continue
+            color_index = round(index * last_index / (visible_length - 1))
+            rendered.append(f"{self.busy_gradient[color_index]}{character}")
+        return "".join(rendered) + self.reset
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Show tmux workspace summaries or open an interactive monitor that "
+            "submits only explicit user-entered messages."
+        )
+    )
+    parser.add_argument("--socket", help="Exact tmux socket path (defaults to this user's server)")
+    parser.add_argument(
+        "--history-lines",
+        type=int,
+        default=0,
+        help=(
+            "maximum tmux history lines to capture per selected chat; "
+            "0 uses the pane's complete retained history (default)"
+        ),
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--watch", dest="watch", action="store_true",
+                      help="open the live full-screen dashboard (default)")
+    mode.add_argument("--summary", dest="watch", action="store_false",
+                      help="print a workspace summary and exit")
+    parser.set_defaults(watch=True)
+    parser.add_argument("--version", action="version", version=f"Tmuxius {VERSION}")
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=0.5,
+        help="selected-chat refresh interval in seconds (default: 0.5)",
+    )
+    parser.add_argument("--no-color", action="store_true")
+    parser.add_argument("--self-test", action="store_true")
+    args = parser.parse_args()
+    if args.history_lines != 0 and not 20 <= args.history_lines <= 200000:
+        parser.error("--history-lines must be 0 or between 20 and 200000")
+    if not 0.25 <= args.interval <= 60:
+        parser.error("--interval must be between 0.25 and 60 seconds")
+    return args
+
+
+def tmux_command(socket: str | None, *arguments: str) -> list[str]:
+    command = ["tmux"]
+    if socket:
+        command.extend(["-S", socket])
+    command.extend(arguments)
+    return command
+
+
+def run_tmux(socket: str | None, *arguments: str, timeout: float = 2.0) -> str:
+    try:
+        result = subprocess.run(
+            tmux_command(socket, *arguments),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise TmuxError(str(exc)) from exc
+    if result.returncode != 0:
+        detail = clean_text(result.stderr).strip() or f"tmux exited {result.returncode}"
+        raise TmuxError(detail)
+    return result.stdout
+
+
+def clean_text(value: str) -> str:
+    value = ANSI_RE.sub("", value)
+    value = CONTROL_RE.sub("", value)
+    return SPACE_RE.sub(" ", value).strip()
+
+
+def sgr_parameters(value: str) -> list[int]:
+    """Normalize semicolon and modern colon-form SGR parameters."""
+    if not value:
+        return [0]
+    parameters: list[int] = []
+    for field in value.split(";"):
+        if ":" not in field:
+            try:
+                parameters.append(int(field) if field else 0)
+            except ValueError:
+                continue
+            continue
+        components = field.split(":")
+        try:
+            command = int(components[0])
+            mode = int(components[1])
+        except (IndexError, ValueError):
+            continue
+        if command not in {38, 48}:
+            parameters.append(command)
+            continue
+        if mode == 5 and len(components) >= 3:
+            try:
+                parameters.extend((command, mode, int(components[-1])))
+            except ValueError:
+                continue
+        elif mode == 2 and len(components) >= 5:
+            try:
+                parameters.extend(
+                    (command, mode, *(int(component) for component in components[-3:]))
+                )
+            except ValueError:
+                continue
+    return parameters or [0]
+
+
+@functools.lru_cache(maxsize=512)
+def apply_sgr(style: TerminalStyle, value: str) -> TerminalStyle:
+    parameters = sgr_parameters(value)
+    foreground = style.foreground
+    background = style.background
+    bold = style.bold
+    dim = style.dim
+    italic = style.italic
+    underline = style.underline
+    reverse = style.reverse
+    strike = style.strike
+    index = 0
+    while index < len(parameters):
+        parameter = parameters[index]
+        index += 1
+        if parameter == 0:
+            foreground = None
+            background = None
+            bold = dim = italic = underline = reverse = strike = False
+        elif parameter == 1:
+            bold = True
+        elif parameter == 2:
+            dim = True
+        elif parameter == 3:
+            italic = True
+        elif parameter in {4, 21}:
+            underline = True
+        elif parameter == 7:
+            reverse = True
+        elif parameter == 9:
+            strike = True
+        elif parameter == 22:
+            bold = dim = False
+        elif parameter == 23:
+            italic = False
+        elif parameter == 24:
+            underline = False
+        elif parameter == 27:
+            reverse = False
+        elif parameter == 29:
+            strike = False
+        elif 30 <= parameter <= 37:
+            foreground = parameter - 30
+        elif 90 <= parameter <= 97:
+            foreground = parameter - 90 + 8
+        elif parameter == 39:
+            foreground = None
+        elif 40 <= parameter <= 47:
+            background = parameter - 40
+        elif 100 <= parameter <= 107:
+            background = parameter - 100 + 8
+        elif parameter == 49:
+            background = None
+        elif parameter in {38, 48} and index < len(parameters):
+            mode = parameters[index]
+            index += 1
+            color: int | tuple[int, int, int] | None = None
+            if mode == 5 and index < len(parameters):
+                color = max(0, min(255, parameters[index]))
+                index += 1
+            elif mode == 2 and index + 2 < len(parameters):
+                color = tuple(
+                    max(0, min(255, component))
+                    for component in parameters[index : index + 3]
+                )
+                index += 3
+            if color is not None:
+                if parameter == 38:
+                    foreground = color
+                else:
+                    background = color
+    return TerminalStyle(
+        foreground,
+        background,
+        bold,
+        dim,
+        italic,
+        underline,
+        reverse,
+        strike,
+    )
+
+
+def merge_preview_spans(spans: list[PreviewSpan]) -> tuple[PreviewSpan, ...]:
+    merged: list[PreviewSpan] = []
+    for span in spans:
+        if span.end <= span.start:
+            continue
+        if (
+            merged
+            and merged[-1].end == span.start
+            and merged[-1].style == span.style
+        ):
+            merged[-1] = PreviewSpan(merged[-1].start, span.end, span.style)
+        else:
+            merged.append(span)
+    return tuple(merged)
+
+
+def parse_preview_text(
+    value: str, *, preserve_default_style: bool = False
+) -> tuple[str, tuple[PreviewSpan, ...]]:
+    """Remove terminal controls while retaining tmux-captured SGR style runs."""
+    if "\x1b" not in value:
+        text = CONTROL_RE.sub("", value.replace("\u00a0", " ")).expandtabs(4).rstrip()
+        spans = (
+            (PreviewSpan(0, len(text), TerminalStyle()),)
+            if preserve_default_style and text
+            else ()
+        )
+        return text, spans
+    fragments: list[str] = []
+    span_runs: list[tuple[int, int, TerminalStyle]] = []
+    style = TerminalStyle()
+    saw_sgr = False
+    length = 0
+
+    def append_fragment(fragment: str) -> None:
+        nonlocal length
+        fragment = CONTROL_RE.sub("", fragment.replace("\u00a0", " "))
+        if not fragment:
+            return
+        if "\t" in fragment:
+            expanded: list[str] = []
+            column = length
+            for character in fragment:
+                if character == "\t":
+                    spaces = 4 - column % 4
+                    expanded.append(" " * spaces)
+                    column += spaces
+                else:
+                    expanded.append(character)
+                    column += 1
+            fragment = "".join(expanded)
+        start = length
+        fragments.append(fragment)
+        length += len(fragment)
+        if span_runs and span_runs[-1][1] == start and span_runs[-1][2] == style:
+            span_runs[-1] = (span_runs[-1][0], length, style)
+        else:
+            span_runs.append((start, length, style))
+
+    cursor = 0
+    for ansi in ANSI_RE.finditer(value):
+        append_fragment(value[cursor : ansi.start()])
+        sgr = SGR_RE.fullmatch(ansi.group(0))
+        if sgr:
+            saw_sgr = True
+            style = apply_sgr(style, sgr.group(1))
+        cursor = ansi.end()
+    append_fragment(value[cursor:])
+
+    text = "".join(fragments).rstrip()
+    if not (saw_sgr or preserve_default_style) or not text:
+        return text, ()
+    end = len(text)
+    return text, merge_preview_spans(
+        [
+            PreviewSpan(start, min(stop, end), run_style)
+            for start, stop, run_style in span_runs
+            if start < end
+        ]
+    )
+
+
+def preview_span_slice(
+    line: PreviewLine,
+    start: int,
+    end: int,
+    destination_start: int,
+    *,
+    materialize_default: bool = False,
+) -> list[PreviewSpan]:
+    if end <= start:
+        return []
+    if not line.spans:
+        return (
+            [PreviewSpan(destination_start, destination_start + end - start, TerminalStyle())]
+            if materialize_default
+            else []
+        )
+    sliced: list[PreviewSpan] = []
+    cursor = start
+    for span in line.spans:
+        overlap_start = max(start, span.start)
+        overlap_end = min(end, span.end)
+        if overlap_end <= overlap_start:
+            continue
+        if materialize_default and overlap_start > cursor:
+            sliced.append(
+                PreviewSpan(
+                    destination_start + cursor - start,
+                    destination_start + overlap_start - start,
+                    TerminalStyle(),
+                )
+            )
+        sliced.append(
+            PreviewSpan(
+                destination_start + overlap_start - start,
+                destination_start + overlap_end - start,
+                span.style,
+            )
+        )
+        cursor = overlap_end
+    if materialize_default and cursor < end:
+        sliced.append(
+            PreviewSpan(
+                destination_start + cursor - start,
+                destination_start + end - start,
+                TerminalStyle(),
+            )
+        )
+    return sliced
+
+
+def preview_style_at(line: PreviewLine, position: int) -> TerminalStyle:
+    for span in line.spans:
+        if span.start <= position < span.end:
+            return span.style
+    return TerminalStyle()
+
+
+def is_paste_token(character: str) -> bool:
+    return len(character) == 1 and PASTE_TOKEN_START <= ord(character) <= PASTE_TOKEN_END
+
+
+def sanitize_composer_input(value: str) -> str:
+    """Keep text and paste newlines while dropping terminal-control payloads."""
+    value = ANSI_RE.sub("", value)
+    value = value.replace("\r\n", "\n").replace("\r", "\n")
+    return "".join(
+        character
+        for character in value
+        if character in {"\n", "\t"}
+        or (
+            ord(character) >= 32
+            and ord(character) != 127
+            and not is_paste_token(character)
+        )
+    )
+
+
+def expand_composer_text(value: str, paste_payloads: dict[str, str]) -> str:
+    return "".join(
+        paste_payloads.get(character, "") if is_paste_token(character) else character
+        for character in value
+    )
+
+
+def composer_expanded_length(value: str, paste_payloads: dict[str, str]) -> int:
+    return sum(
+        len(paste_payloads.get(character, ""))
+        if is_paste_token(character)
+        else 1
+        for character in value
+    )
+
+
+def purge_orphaned_pastes(state: DashboardState) -> None:
+    used = {character for character in state.text if is_paste_token(character)}
+    state.paste_payloads = {
+        token: payload
+        for token, payload in state.paste_payloads.items()
+        if token in used
+    }
+
+
+def allocate_paste_token(state: DashboardState) -> str:
+    used = set(state.paste_payloads)
+    used.update(state.inflight_paste_payloads)
+    for payloads in state.draft_paste_payloads.values():
+        used.update(payloads)
+    capacity = PASTE_TOKEN_END - PASTE_TOKEN_START + 1
+    for _ in range(capacity):
+        codepoint = state.next_paste_token
+        state.next_paste_token += 1
+        if state.next_paste_token > PASTE_TOKEN_END:
+            state.next_paste_token = PASTE_TOKEN_START
+        token = chr(codepoint)
+        if token not in used:
+            return token
+    raise RuntimeError("too many pending pasted-content objects")
+
+
+def insert_composer_text(
+    state: DashboardState, value: str, *, pasted: bool = False
+) -> bool:
+    cleaned = sanitize_composer_input(value)
+    if not cleaned:
+        return False
+    current_chars = composer_expanded_length(state.text, state.paste_payloads)
+    if current_chars + len(cleaned) > MAX_MESSAGE_CHARS:
+        return False
+    inserted = cleaned
+    if pasted and len(cleaned) > LARGE_PASTE_CHAR_THRESHOLD:
+        token = allocate_paste_token(state)
+        state.paste_payloads[token] = cleaned
+        inserted = token
+    state.text = state.text[: state.cursor] + inserted + state.text[state.cursor :]
+    state.cursor += len(inserted)
+    return True
+
+
+def outbound_composer_message(
+    value: str, paste_payloads: dict[str, str] | None = None
+) -> str:
+    # Submission is a separate verified Enter after tmux bracketed-paste, so a
+    # trailing newline remains content rather than becoming an early submit.
+    expanded = expand_composer_text(value, paste_payloads or {})
+    return sanitize_composer_input(expanded)
+
+
+def render_composer_text(
+    value: str, paste_payloads: dict[str, str] | None = None
+) -> str:
+    payloads = paste_payloads or {}
+    rendered: list[str] = []
+    for character in value:
+        if is_paste_token(character):
+            rendered.append(
+                f"[Pasted Content {len(payloads.get(character, ''))} chars]"
+            )
+        elif character == "\n":
+            rendered.append(" \\n ")
+        elif character == "\t":
+            rendered.append(" \\t ")
+        else:
+            rendered.append(character)
+    return "".join(rendered)
+
+
+def delete_previous_word(state: DashboardState) -> None:
+    if state.cursor <= 0:
+        return
+    if is_paste_token(state.text[state.cursor - 1]):
+        state.text = state.text[: state.cursor - 1] + state.text[state.cursor :]
+        state.cursor -= 1
+        purge_orphaned_pastes(state)
+        return
+    start = state.cursor
+    while start > 0 and state.text[start - 1].isspace():
+        start -= 1
+    while start > 0 and not state.text[start - 1].isspace():
+        start -= 1
+    state.text = state.text[:start] + state.text[state.cursor :]
+    state.cursor = start
+    purge_orphaned_pastes(state)
+
+
+def safe_label(value: str, fallback: str = "?") -> str:
+    cleaned = clean_text(value)
+    if not cleaned:
+        return fallback
+    return cleaned[:32]
+
+
+def safe_summary(value: str, min_length: int = 12) -> str | None:
+    cleaned = clean_text(value).strip(" │─└┌┐┘")
+    cleaned = re.sub(r"^[•●◦›❯]\s*", "", cleaned)
+    cleaned = cleaned.replace("`", "")
+    if len(cleaned) < min_length:
+        return None
+    if SECRET_WORD_RE.search(cleaned) or SECRET_VALUE_RE.search(cleaned):
+        return None
+    if cleaned.count("{") + cleaned.count("[") >= 3:
+        return None
+    return cleaned
+
+
+def explicit_window_subject(pane: Pane) -> str | None:
+    """Return only a deliberate tmux name, never its automatic command label."""
+    if pane.automatic_rename:
+        return None
+    return safe_summary(pane.window_name, min_length=1)
+
+
+def workspace_subject(workspace: Workspace) -> str:
+    return workspace.window_title or workspace.summary
+
+
+def transcript_summary(snapshot: str) -> str:
+    lines = snapshot.splitlines()
+    for raw in reversed(lines):
+        line = clean_text(raw)
+        match = re.match(r"^[•●]\s+(.+)$", line)
+        if not match:
+            continue
+        candidate = match.group(1).strip()
+        if ACTION_PREFIX_RE.match(candidate):
+            continue
+        safe = safe_summary(candidate)
+        if safe:
+            return safe
+
+    for raw in reversed(lines):
+        line = clean_text(raw)
+        match = re.match(r"^[›❯]\s+(.+)$", line)
+        if not match:
+            continue
+        candidate = match.group(1).strip()
+        if PROMPT_PLACEHOLDER_RE.match(candidate):
+            continue
+        safe = safe_summary(candidate)
+        if safe:
+            return safe
+    return "No safe recent summary available"
+
+
+def preview_line_kind(line: str, previous_kind: str) -> str:
+    content = line.lstrip()
+    lowered = content.casefold()
+    if content.startswith(("›", "❯")):
+        return "user"
+    if content.startswith("◦") or lowered.startswith(
+        ("working (", "computing (", "waiting for background terminal")
+    ):
+        return "working"
+    if "background terminal" in lowered and re.match(
+        r"(?i)^(?:[•●·]\s*)?\d+\s+background terminals?\s+running\b", content
+    ):
+        return "working"
+    if content.startswith(("•", "●")):
+        body = re.sub(r"^[•●]\s*", "", content)
+        if body.casefold().startswith(
+            ("working (", "computing (", "waiting for background terminal")
+        ):
+            return "working"
+        return "tool" if ACTION_PREFIX_RE.match(body) else "assistant"
+    if content.startswith(("└", "├", "│", "…")):
+        return "tool"
+    if previous_kind == "tool" and re.match(r"^(?:\d+\s+)?\+(?!\+)", content):
+        return "addition"
+    if previous_kind == "tool" and re.match(r"^(?:\d+\s+)?-(?!-)", content):
+        return "deletion"
+    if line[:1].isspace() and previous_kind in {"user", "assistant", "tool"}:
+        return previous_kind
+    return "body"
+
+
+def is_preview_separator(line: str) -> bool:
+    content = line.strip()
+    return len(content) >= 8 and set(content) <= {
+        "-",
+        "_",
+        "=",
+        "─",
+        "━",
+        "┄",
+        "┈",
+    }
+
+
+def reflow_preview_paragraphs(lines: list[PreviewLine]) -> list[PreviewLine]:
+    """Join narrow Codex visual wraps without changing the monitored pane."""
+    reflowed: list[PreviewLine] = []
+    for line in lines:
+        content = line.text.lstrip(" ")
+        leading_spaces = len(line.text) - len(content)
+        can_join = (
+            bool(reflowed)
+            and line.kind in {"user", "assistant"}
+            and reflowed[-1].kind == line.kind
+            and leading_spaces == 2
+            and bool(content)
+            and not PREVIEW_REFLOW_BOUNDARY_RE.match(content)
+        )
+        if can_join:
+            previous = reflowed[-1]
+            previous_text = previous.text.rstrip()
+            content_start = len(line.text) - len(content)
+            joined_text = f"{previous_text} {content}"
+            joined_spans: tuple[PreviewSpan, ...] = ()
+            if previous.spans or line.spans:
+                span_list = preview_span_slice(
+                    previous,
+                    0,
+                    len(previous_text),
+                    0,
+                    materialize_default=True,
+                )
+                gap_start = len(previous_text)
+                gap_style = preview_style_at(
+                    line, min(content_start, max(0, len(line.text) - 1))
+                )
+                span_list.append(PreviewSpan(gap_start, gap_start + 1, gap_style))
+                span_list.extend(
+                    preview_span_slice(
+                        line,
+                        content_start,
+                        len(line.text),
+                        gap_start + 1,
+                        materialize_default=True,
+                    )
+                )
+                joined_spans = merge_preview_spans(span_list)
+            reflowed[-1] = replace(
+                previous,
+                text=joined_text,
+                spans=joined_spans,
+            )
+        else:
+            reflowed.append(line)
+    return reflowed
+
+
+def safe_preview_lines(
+    snapshot: str, limit: int | None = None
+) -> tuple[PreviewLine, ...]:
+    preview: list[PreviewLine] = []
+    previous_kind = "body"
+    preserve_default_style = bool(SGR_RE.search(snapshot))
+    for raw in snapshot.splitlines():
+        line, spans = parse_preview_text(
+            raw, preserve_default_style=preserve_default_style
+        )
+        content = line.lstrip()
+        if not content:
+            if preview and preview[-1].kind != "blank":
+                preview.append(PreviewLine("", "blank"))
+            continue
+        placeholder_candidate = re.sub(r"^[›❯]\s*", "", content)
+        if PROMPT_PLACEHOLDER_RE.match(placeholder_candidate) or re.match(
+            r"(?i)^gpt-\d", content
+        ):
+            continue
+        if is_preview_separator(line):
+            kind = "separator"
+            rendered = "─"
+            spans = ()
+        else:
+            kind = preview_line_kind(line, previous_kind)
+            rendered = line
+        if kind == "separator" and preview and preview[-1].kind == "separator":
+            continue
+        preview.append(PreviewLine(rendered, kind, spans=spans))
+        if kind not in {"blank", "separator", "addition", "deletion"}:
+            previous_kind = kind
+    while preview and preview[-1].kind == "blank":
+        preview.pop()
+    preview = reflow_preview_paragraphs(preview)
+    if limit is not None:
+        if limit <= 0:
+            return ()
+        preview = preview[-limit:]
+    return tuple(preview)
+
+
+def session_sort_key(session: Session) -> tuple[int, int | str]:
+    if session.name.isdecimal():
+        return (0, int(session.name))
+    return (1, session.name.casefold())
+
+
+def list_sessions(socket: str | None) -> list[Session]:
+    output = run_tmux(
+        socket,
+        "list-sessions",
+        "-F",
+        SEP.join(
+            ["#{session_id}", "#{session_name}", "#{session_attached}", "#{session_activity}"]
+        ),
+    )
+    sessions: list[Session] = []
+    for raw in output.splitlines():
+        session_id, separator, remainder = raw.partition(SEP)
+        if not separator:
+            continue
+        fields = remainder.rsplit(SEP, 2)
+        if len(fields) != 3:
+            continue
+        name, attached_text, activity_text = fields
+        try:
+            attached = int(attached_text)
+            activity = int(activity_text)
+        except ValueError:
+            continue
+        sessions.append(Session(session_id, name, attached, activity))
+    return sorted(sessions, key=session_sort_key)
+
+
+def active_pane(socket: str | None, session: Session) -> Pane:
+    output = run_tmux(
+        socket,
+        "display-message",
+        "-p",
+        "-t",
+        session.session_id,
+        SEP.join(
+            [
+                "#{window_index}",
+                "#{pane_index}",
+                "#{pane_id}",
+                "#{pane_current_command}",
+                "#{pane_pid}",
+                "#{window_name}",
+                "#{?automatic-rename,1,0}",
+                f"#{{{CODEX_NAME_CACHE_OPTION}}}",
+            ]
+        ),
+    ).rstrip("\n")
+    fields = output.split(SEP)
+    if len(fields) != 8:
+        raise TmuxError("active pane metadata was incomplete")
+    try:
+        pid = int(fields[4])
+    except ValueError as exc:
+        raise TmuxError("active pane PID was invalid") from exc
+    return Pane(
+        fields[0],
+        fields[1],
+        fields[2],
+        fields[3],
+        pid,
+        clean_text(fields[5]),
+        fields[6] == "1",
+        fields[7],
+    )
+
+
+def list_active_panes(socket: str | None) -> dict[str, Pane]:
+    output = run_tmux(
+        socket,
+        "list-panes",
+        "-a",
+        "-F",
+        SEP.join(
+            [
+                "#{session_id}",
+                "#{window_active}",
+                "#{pane_active}",
+                "#{window_index}",
+                "#{pane_index}",
+                "#{pane_id}",
+                "#{pane_current_command}",
+                "#{pane_pid}",
+                "#{window_name}",
+                "#{?automatic-rename,1,0}",
+                f"#{{{CODEX_NAME_CACHE_OPTION}}}",
+            ]
+        ),
+    )
+    panes: dict[str, Pane] = {}
+    for raw in output.splitlines():
+        fields = raw.split(SEP)
+        if len(fields) != 11 or fields[1] != "1" or fields[2] != "1":
+            continue
+        try:
+            pid = int(fields[7])
+        except ValueError:
+            continue
+        panes[fields[0]] = Pane(
+            fields[3],
+            fields[4],
+            fields[5],
+            fields[6],
+            pid,
+            clean_text(fields[8]),
+            fields[9] == "1",
+            fields[10],
+        )
+    return panes
+
+
+def capture_start_line(history_lines: int) -> str:
+    return "-" if history_lines == 0 else f"-{history_lines}"
+
+
+def capture_snapshot(socket: str | None, pane: Pane, history_lines: int) -> str:
+    return run_tmux(
+        socket,
+        "capture-pane",
+        "-e",
+        "-p",
+        "-J",
+        "-S",
+        capture_start_line(history_lines),
+        "-t",
+        pane.pane_id,
+    )
+
+
+def capture_snapshots(
+    socket: str | None, panes: list[Pane], history_lines: int
+) -> dict[str, str]:
+    """Capture several pane tails through one tmux client connection."""
+    if not panes:
+        return {}
+    nonce = uuid.uuid4().hex
+    marker_to_pane: dict[str, str] = {}
+    arguments: list[str] = []
+    for index, pane in enumerate(panes):
+        marker = f"__TMUX_DASHBOARD_{nonce}_{index}__"
+        marker_to_pane[marker] = pane.pane_id
+        if arguments:
+            arguments.append(";")
+        arguments.extend(
+            ["display-message", "-p", "-t", pane.pane_id, marker]
+        )
+        arguments.extend(
+            [
+                ";",
+                "capture-pane",
+                "-e",
+                "-p",
+                "-J",
+                "-S",
+                capture_start_line(history_lines),
+                "-t",
+                pane.pane_id,
+            ]
+        )
+    output = run_tmux(
+        socket,
+        *arguments,
+        timeout=max(2.0, min(10.0, 0.5 * len(panes))),
+    )
+    snapshots: dict[str, list[str]] = {
+        pane.pane_id: [] for pane in panes
+    }
+    active_pane_id: str | None = None
+    for line in output.splitlines(keepends=True):
+        marker = line.rstrip("\r\n")
+        if marker in marker_to_pane:
+            active_pane_id = marker_to_pane[marker]
+            continue
+        if active_pane_id is not None:
+            snapshots[active_pane_id].append(line)
+    return {
+        pane_id: "".join(lines)
+        for pane_id, lines in snapshots.items()
+    }
+
+
+def semantic_snapshot_signature(snapshot: str) -> str:
+    """Hash visible content while ignoring busy-timer ticks and line wrapping."""
+    # Full selected-chat captures and lightweight background captures use
+    # different history depths. Compare only their shared live tail.
+    live_tail = "\n".join(snapshot.splitlines()[-40:])
+    normalized = ANSI_RE.sub("", live_tail).replace("\u00a0", " ")
+    normalized = BUSY_TICK_RE.sub(r"\1 (active)", normalized)
+    normalized = SPACE_RE.sub(" ", normalized).strip()
+    return hashlib.blake2s(normalized.encode("utf-8"), digest_size=12).hexdigest()
+
+
+def preview_snapshot_signature(
+    snapshot: str, semantic_signature: str | None = None
+) -> str:
+    """Cache identical frames while retaining timer, style, and history changes."""
+    return hashlib.blake2s(snapshot.encode("utf-8"), digest_size=12).hexdigest()
+
+
+
+def read_processes() -> dict[int, Process]:
+    try:
+        result = subprocess.run(
+            ["ps", "-ww", "-eo", "pid=,ppid=,pgid=,tpgid=,comm=,args="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if result.returncode != 0:
+        return {}
+    processes: dict[int, Process] = {}
+    for line in result.stdout.splitlines():
+        fields = line.strip().split(None, 5)
+        if len(fields) < 5:
+            continue
+        try:
+            pid, ppid, pgid, tpgid = map(int, fields[:4])
+        except ValueError:
+            continue
+        processes[pid] = Process(
+            pid,
+            ppid,
+            pgid,
+            tpgid,
+            fields[4],
+            fields[5] if len(fields) == 6 else "",
+        )
+    return processes
+
+
+def process_family(root_pid: int, processes: dict[int, Process]) -> list[Process]:
+    children: dict[int, list[int]] = {}
+    for process in processes.values():
+        children.setdefault(process.ppid, []).append(process.pid)
+    found: list[Process] = []
+    pending = [root_pid]
+    seen: set[int] = set()
+    while pending and len(seen) < 256:
+        pid = pending.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        process = processes.get(pid)
+        if process:
+            found.append(process)
+        pending.extend(children.get(pid, []))
+    return found
+
+
+def thread_ref_from_rollout_path(path: str) -> tuple[str, str, str] | None:
+    marker = "/sessions/"
+    if marker not in path:
+        return None
+    match = THREAD_ID_RE.search(path)
+    if not match:
+        return None
+    return path.split(marker, 1)[0], match.group(1), path
+
+
+def codex_thread_refs(
+    pane: Pane, processes: dict[int, Process]
+) -> list[tuple[str, str, str]]:
+    family = process_family(pane.pid, processes)
+    pane_process = processes.get(pane.pid)
+    foreground_pgid = pane_process.tpgid if pane_process else -1
+    codex_processes = [process for process in family if process.command == "codex"]
+    codex_processes.sort(key=lambda process: process.pgid != foreground_pgid)
+    references: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    for process in codex_processes:
+        if foreground_pgid > 0 and process.pgid != foreground_pgid:
+            continue
+        try:
+            descriptors = os.scandir(f"/proc/{process.pid}/fd")
+        except OSError:
+            continue
+        with descriptors:
+            for descriptor in descriptors:
+                try:
+                    target = os.readlink(descriptor.path)
+                except OSError:
+                    continue
+                reference = thread_ref_from_rollout_path(target)
+                if reference and reference not in seen:
+                    seen.add(reference)
+                    references.append(reference)
+    return references
+
+
+def codex_title_candidate(
+    name: object,
+    title: object,
+    first_user_message: object,
+    thread_source: object,
+    updated_at: object,
+    retained_name: object = None,
+) -> tuple[tuple[int, int, int], str] | None:
+    source_rank = 0
+    candidate: str | None = None
+    for rank, value, min_length in (
+        (3, name, 1),
+        (3, retained_name, 1),
+        (2, title, 3),
+        (1, first_user_message, 3),
+    ):
+        candidate = safe_summary(str(value or ""), min_length=min_length)
+        if candidate:
+            source_rank = rank
+            break
+    if candidate is None:
+        return None
+    primary_rank = 0 if str(thread_source or "").casefold() == "subagent" else 1
+    try:
+        recency = int(updated_at or 0)
+    except (TypeError, ValueError):
+        recency = 0
+    return (primary_rank, source_rank, recency), candidate[:240]
+
+
+def retained_codex_names(pane: Pane) -> dict[str, str]:
+    try:
+        value = json.loads(pane.codex_name_cache or "{}")
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    retained: dict[str, str] = {}
+    for thread_id, name in value.items():
+        if (
+            not isinstance(thread_id, str)
+            or not THREAD_ID_VALUE_RE.fullmatch(thread_id)
+        ):
+            continue
+        safe_name = safe_summary(str(name or ""), min_length=1)
+        if safe_name:
+            retained[thread_id] = safe_name[:240]
+    return retained
+
+
+def retained_codex_name(
+    pane: Pane, thread_id: str, current_name: object
+) -> str | None:
+    observed = safe_summary(str(current_name or ""), min_length=1)
+    if observed:
+        return observed[:240]
+    return retained_codex_names(pane).get(thread_id)
+
+
+def persist_codex_name(
+    socket: str | None, pane: Pane, details: CodexThreadDetails
+) -> None:
+    thread_id = details.thread_id or ""
+    name = details.current_name or ""
+    if not THREAD_ID_VALUE_RE.fullmatch(thread_id) or not name:
+        return
+    retained = retained_codex_names(pane)
+    if retained.get(thread_id) == name:
+        return
+    retained.pop(thread_id, None)
+    retained[thread_id] = name
+    while len(retained) > MAX_RETAINED_CODEX_NAMES:
+        retained.pop(next(iter(retained)))
+    encoded = json.dumps(retained, ensure_ascii=False, separators=(",", ":"))
+    try:
+        run_tmux(
+            socket,
+            "set-option",
+            "-p",
+            "-t",
+            pane.pane_id,
+            CODEX_NAME_CACHE_OPTION,
+            encoded,
+        )
+    except TmuxError:
+        # Subject collection must remain useful if pane metadata is read-only.
+        return
+
+
+def codex_thread_details(
+    pane: Pane, processes: dict[int, Process]
+) -> CodexThreadDetails:
+    references = codex_thread_refs(pane, processes)
+    if not references:
+        return CodexThreadDetails(None, None)
+
+    last_activity: float | None = None
+    references_by_home: dict[str, list[tuple[str, str]]] = {}
+    for codex_home, thread_id, rollout_path in references:
+        references_by_home.setdefault(codex_home, []).append(
+            (thread_id, rollout_path)
+        )
+        try:
+            modified = os.stat(rollout_path).st_mtime
+        except OSError:
+            continue
+        last_activity = max(last_activity or 0.0, modified)
+
+    candidates: list[tuple[tuple[int, int, int], str, str, str | None]] = []
+    for codex_home, home_references in references_by_home.items():
+        thread_ids = list(dict.fromkeys(item[0] for item in home_references))
+        placeholders = ",".join("?" for _ in thread_ids)
+        database = os.path.join(codex_home, "state_5.sqlite")
+        try:
+            connection = sqlite3.connect(
+                f"file:{database}?mode=ro", uri=True, timeout=0.2
+            )
+            try:
+                try:
+                    rows = connection.execute(
+                        "SELECT id, name, title, first_user_message, "
+                        "thread_source, updated_at FROM threads "
+                        f"WHERE id IN ({placeholders})",
+                        thread_ids,
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    legacy_rows = connection.execute(
+                        "SELECT id, name, title, first_user_message FROM threads "
+                        f"WHERE id IN ({placeholders})",
+                        thread_ids,
+                    ).fetchall()
+                    rows = [(*row, "", 0) for row in legacy_rows]
+            finally:
+                connection.close()
+        except (OSError, sqlite3.Error):
+            continue
+        for (
+            thread_id,
+            name,
+            title,
+            first_user_message,
+            thread_source,
+            updated_at,
+        ) in rows:
+            current_name = safe_summary(str(name or ""), min_length=1)
+            retained_name = retained_codex_name(pane, thread_id, current_name)
+            candidate = codex_title_candidate(
+                name,
+                title,
+                first_user_message,
+                thread_source,
+                updated_at,
+                retained_name,
+            )
+            if candidate is not None:
+                candidates.append((*candidate, thread_id, current_name))
+
+    if not candidates:
+        return CodexThreadDetails(None, last_activity)
+    _, subject, thread_id, current_name = max(candidates, key=lambda item: item[0])
+    return CodexThreadDetails(subject, last_activity, thread_id, current_name)
+
+
+def app_name(pane: Pane, snapshot: str, processes: dict[int, Process]) -> str:
+    family = process_family(pane.pid, processes)
+    process_text = " ".join(f"{p.command} {p.args}" for p in family).casefold()
+    tail = snapshot[-6000:].casefold()
+    if re.search(r"(?:^|[/\s])codex(?:[/\s]|$)|@openai/codex", process_text):
+        return "Codex"
+    if re.search(r"(?:^|[/\s])claude(?:[/\s]|$)|@anthropic-ai/claude", process_text):
+        return "Claude"
+    if "gpt-5." in tail and "esc to interrupt" in tail:
+        return "Codex"
+    if "claude code" in tail:
+        return "Claude"
+    command = safe_label(pane.command, "shell")
+    if command.casefold() in {"bash", "zsh", "fish", "sh", "dash"}:
+        return "shell"
+    return command[:10]
+
+
+def work_state(snapshot: str) -> str:
+    tail_lines = snapshot.splitlines()[-18:]
+    tail = "\n".join(clean_text(line) for line in tail_lines)
+    return "busy" if BUSY_RE.search(tail) else "ready"
+
+
+def busy_duration(snapshot: str) -> int | None:
+    tail_lines = snapshot.splitlines()[-24:]
+    tail = "\n".join(clean_text(line) for line in tail_lines)
+    matches = list(BUSY_DURATION_RE.finditer(tail))
+    if not matches:
+        return None
+    hours, minutes, seconds = matches[-1].groups(default="0")
+    return int(hours) * 3600 + int(minutes) * 60 + int(seconds)
+
+
+def activity_tier(
+    last_activity: float | None,
+    state: str,
+    now: float | None = None,
+) -> str:
+    if state == "busy":
+        return "busy"
+    if last_activity is None:
+        return "unknown"
+    current_time = time.time() if now is None else now
+    age = max(0.0, current_time - last_activity)
+    if age <= GREEN_ACTIVITY_SECONDS:
+        return "green"
+    if age < READY_ACTIVITY_SECONDS:
+        return "recent"
+    if age <= FINISHING_ACTIVITY_SECONDS:
+        return "orange"
+    return "complete"
+
+
+def lifecycle_label(state: str, tier: str) -> str:
+    if state == "busy":
+        return "busy"
+    if tier == "orange":
+        return "finishing"
+    if tier == "complete":
+        return "complete"
+    return "ready"
+
+
+def format_elapsed(seconds: int | float | None) -> str:
+    if seconds is None:
+        return "-"
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total}s"
+    if total < 3600:
+        minutes, remainder = divmod(total, 60)
+        return f"{minutes}m{remainder:02d}s"
+    if total < 86400:
+        hours, remainder = divmod(total, 3600)
+        minutes = remainder // 60
+        return f"{hours}h{minutes:02d}m"
+    days, remainder = divmod(total, 86400)
+    return f"{days}d{remainder // 3600:02d}h"
+
+
+def format_activity_age(last_activity: float | None, now: float | None = None) -> str:
+    if last_activity is None:
+        return "unknown"
+    current_time = time.time() if now is None else now
+    age = max(0, int(current_time - last_activity))
+    return "now" if age < 5 else format_elapsed(age)
+
+
+def collect_workspaces(
+    sessions: list[Session],
+    socket: str | None,
+    history_lines: int,
+    *,
+    exclude_pane_id: str | None = None,
+) -> list[Workspace]:
+    processes = read_processes()
+    panes = list_active_panes(socket)
+    workspaces: list[Workspace] = []
+    for session in sessions:
+        pane = panes.get(session.session_id)
+        if pane is not None and pane.pane_id == exclude_pane_id:
+            continue
+        if pane is None:
+            workspaces.append(
+                Workspace(session, "", "?", "?", "Summary unavailable", None, None, ())
+            )
+            continue
+        try:
+            snapshot = capture_snapshot(socket, pane, history_lines)
+            app = app_name(pane, snapshot, processes)
+            state = work_state(snapshot)
+            thread_details = codex_thread_details(pane, processes)
+            persist_codex_name(socket, pane, thread_details)
+            summary = thread_details.subject or transcript_summary(snapshot)
+            last_activity = (
+                thread_details.last_activity
+                if thread_details.last_activity is not None
+                else float(session.activity)
+            )
+            duration = busy_duration(snapshot) if state == "busy" else None
+            preview = safe_preview_lines(snapshot)
+            signature = semantic_snapshot_signature(snapshot)
+            preview_signature = preview_snapshot_signature(snapshot, signature)
+        except TmuxError:
+            app, state, summary = "?", "?", "Summary unavailable"
+            last_activity, duration, preview = None, None, ()
+            signature = preview_signature = ""
+        workspaces.append(
+            Workspace(
+                session,
+                pane.pane_id,
+                app,
+                state,
+                summary,
+                last_activity,
+                duration,
+                preview,
+                signature,
+                explicit_window_subject(pane),
+                preview_signature,
+            )
+        )
+    return workspaces
+
+
+def refresh_workspace_from_snapshot(
+    workspace: Workspace,
+    session: Session,
+    snapshot: str,
+    *,
+    now: float,
+    include_preview: bool,
+) -> Workspace:
+    """Refresh volatile pane state without process scans or database reads."""
+    signature = semantic_snapshot_signature(snapshot)
+    last_activity = workspace.last_activity
+    if workspace.signature and signature != workspace.signature:
+        last_activity = max(last_activity or 0.0, now)
+    elif not workspace.signature and session.activity:
+        last_activity = max(last_activity or 0.0, float(session.activity))
+    state = work_state(snapshot)
+    preview = workspace.preview
+    preview_signature = workspace.preview_signature
+    if include_preview:
+        preview_signature = preview_snapshot_signature(snapshot, signature)
+        if not workspace.preview or preview_signature != workspace.preview_signature:
+            preview = safe_preview_lines(snapshot)
+    return replace(
+        workspace,
+        session=session,
+        state=state,
+        last_activity=last_activity,
+        busy_seconds=busy_duration(snapshot) if state == "busy" else None,
+        preview=preview,
+        signature=signature,
+        preview_signature=preview_signature,
+    )
+
+
+def refresh_workspace_details(
+    workspaces: list[Workspace], panes: dict[str, Pane], socket: str | None
+) -> list[Workspace]:
+    """Occasionally refresh app identity and renamed Codex thread titles."""
+    processes = read_processes()
+    refreshed: list[Workspace] = []
+    for workspace in workspaces:
+        pane = panes.get(workspace.session.session_id)
+        if pane is None:
+            refreshed.append(workspace)
+            continue
+        rendered_preview = "\n".join(line.text for line in workspace.preview)
+        app = app_name(pane, rendered_preview, processes)
+        summary = workspace.summary
+        last_activity = workspace.last_activity
+        if app == "Codex":
+            thread_details = codex_thread_details(pane, processes)
+            persist_codex_name(socket, pane, thread_details)
+            if thread_details.subject:
+                summary = thread_details.subject
+            if thread_details.last_activity is not None:
+                last_activity = max(last_activity or 0.0, thread_details.last_activity)
+        refreshed.append(
+            replace(
+                workspace,
+                pane_id=pane.pane_id,
+                app=app,
+                summary=summary,
+                last_activity=last_activity,
+                window_title=explicit_window_subject(pane),
+            )
+        )
+    return refreshed
+
+
+def character_width(value: str) -> int:
+    if unicodedata.combining(value) or unicodedata.category(value) in {"Cc", "Cf", "Cs"}:
+        return 0
+    if unicodedata.east_asian_width(value) in {"A", "F", "W"}:
+        return 2
+    return 1
+
+
+def display_width(value: str) -> int:
+    return sum(character_width(character) for character in value)
+
+
+def display_slice(value: str, start: int, width: int) -> str:
+    if width <= 0:
+        return ""
+    result: list[str] = []
+    position = 0
+    used = 0
+    for character in value:
+        columns = character_width(character)
+        next_position = position + columns
+        if next_position <= start:
+            position = next_position
+            continue
+        if position < start and columns:
+            position = next_position
+            continue
+        if columns and used + columns > width:
+            break
+        if columns == 0 and not result:
+            position = next_position
+            continue
+        result.append(character)
+        used += columns
+        position = next_position
+    return "".join(result)
+
+
+def composer_display_window(
+    text: str,
+    cursor: int,
+    width: int,
+    paste_payloads: dict[str, str] | None = None,
+) -> tuple[str, int]:
+    rendered = render_composer_text(text, paste_payloads)
+    rendered_prefix = render_composer_text(text[:cursor], paste_payloads)
+    cursor_column = display_width(rendered_prefix)
+    start = max(0, cursor_column - max(0, width - 1))
+    visible = display_slice(rendered, start, width)
+    return visible, max(0, min(max(0, width - 1), cursor_column - start))
+
+
+def truncate_display(value: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if display_width(value) <= width:
+        return value
+
+    suffix = "..."
+    if width <= len(suffix):
+        return suffix[:width]
+
+    budget = width - len(suffix)
+    used = 0
+    result: list[str] = []
+    for character in value:
+        character_columns = character_width(character)
+        if character_columns == 0:
+            if result:
+                result.append(character)
+            continue
+        if used + character_columns > budget:
+            break
+        result.append(character)
+        used += character_columns
+    return "".join(result).rstrip() + suffix
+
+
+def display_field(value: str, width: int, *, align_right: bool = False) -> str:
+    clipped = truncate_display(value, width)
+    padding = " " * max(0, width - display_width(clipped))
+    return f"{padding}{clipped}" if align_right else f"{clipped}{padding}"
+
+
+def print_report(
+    sessions: list[Session],
+    socket: str | None,
+    history_lines: int,
+    colors: Colors,
+) -> None:
+    attached_total = sum(session.attached for session in sessions)
+    terminal_width = max(1, shutil.get_terminal_size((100, 24)).columns)
+    # Avoid the terminal's pending-wrap column. Termius may otherwise scroll once
+    # when the following newline arrives, which looks like a hop on login.
+    usable_width = max(1, terminal_width - 2)
+    heading = "tmux workspaces"
+    heading_detail = f"  {len(sessions)} open | {attached_total} attached"
+    print()
+    if display_width(heading) >= usable_width:
+        print(f"{colors.bold}{truncate_display(heading, usable_width)}{colors.reset}")
+    else:
+        detail_width = usable_width - display_width(heading)
+        print(
+            f"{colors.bold}{heading}{colors.reset}"
+            f"{colors.dim}{truncate_display(heading_detail, detail_width)}{colors.reset}"
+        )
+    workspaces = collect_workspaces(sessions, socket, history_lines)
+    name_width = min(
+        12,
+        max(
+            display_width(truncate_display(safe_label(workspace.session.name), 12))
+            for workspace in workspaces
+        ),
+    )
+
+    for workspace in workspaces:
+        session = workspace.session
+        name = display_field(safe_label(session.name), name_width, align_right=True)
+        marker = "+" if session.attached else "-"
+        connection_color = colors.green if session.attached else colors.dim
+        app_field = display_field(workspace.app, 7)
+        tier = activity_tier(workspace.last_activity, workspace.state)
+        state_field = display_field(lifecycle_label(workspace.state, tier), 9)
+        plain_prefix = f"  {name} {marker} {app_field} {state_field}  "
+        summary_width = max(0, min(160, usable_width - display_width(plain_prefix)))
+        state_color = {
+            "green": colors.green,
+            "recent": colors.yellow,
+            "orange": colors.orange,
+            "complete": colors.complete,
+        }.get(tier, colors.dim)
+        rendered_state = (
+            colors.busy(state_field)
+            if tier == "busy"
+            else f"{state_color}{state_field}{colors.reset}"
+        )
+        print(
+            f"  {colors.cyan}{name}{colors.reset} "
+            f"{connection_color}{marker}{colors.reset} "
+            f"{app_field} {rendered_state}  "
+            f"{truncate_display(workspace_subject(workspace), summary_width)}"
+        )
+
+    legend = truncate_display("+ attached | - detached", usable_width)
+    attach_hint = truncate_display("Attach: tmux attach -t <session>", usable_width)
+    print(f"{colors.dim}{legend}{colors.reset}")
+    activity_legend = (
+        "blue-purple busy | green ready <=10m | yellow ready 10-30m | "
+        "orange finishing 30-60m | dark complete >60m"
+    )
+    if display_width(activity_legend) <= usable_width:
+        print(
+            f"{colors.busy('blue-purple busy')} | "
+            f"{colors.green}green ready <=10m{colors.reset} | "
+            f"{colors.yellow}yellow ready 10-30m{colors.reset} | "
+            f"{colors.orange}orange finishing 30-60m{colors.reset} | "
+            f"{colors.complete}dark complete >60m{colors.reset}"
+        )
+    print(f"{colors.dim}{attach_hint}{colors.reset}")
+    print()
+
+
+XTERM_BASE_COLORS = (
+    (0, 0, 0),
+    (128, 0, 0),
+    (0, 128, 0),
+    (128, 128, 0),
+    (0, 0, 128),
+    (128, 0, 128),
+    (0, 128, 128),
+    (192, 192, 192),
+    (128, 128, 128),
+    (255, 0, 0),
+    (0, 255, 0),
+    (255, 255, 0),
+    (0, 0, 255),
+    (255, 0, 255),
+    (0, 255, 255),
+    (255, 255, 255),
+)
+
+
+def xterm_color_rgb(index: int) -> tuple[int, int, int]:
+    index = max(0, min(255, index))
+    if index < 16:
+        return XTERM_BASE_COLORS[index]
+    if index < 232:
+        value = index - 16
+        red, remainder = divmod(value, 36)
+        green, blue = divmod(remainder, 6)
+        levels = (0, 95, 135, 175, 215, 255)
+        return levels[red], levels[green], levels[blue]
+    gray = 8 + (index - 232) * 10
+    return gray, gray, gray
+
+
+def nearest_terminal_color(
+    color: int | tuple[int, int, int], color_count: int
+) -> int:
+    if isinstance(color, int) and 0 <= color < color_count:
+        return color
+    rgb = xterm_color_rgb(color) if isinstance(color, int) else color
+    candidates = min(256, max(1, color_count))
+    return min(
+        range(candidates),
+        key=lambda index: sum(
+            (component - candidate) ** 2
+            for component, candidate in zip(rgb, xterm_color_rgb(index))
+        ),
+    )
+
+
+def initialize_curses_palette(enabled: bool) -> dict[str, int]:
+    global _captured_color_pairs
+    global _captured_next_color_pair
+    global _captured_colors_enabled
+    global _captured_color_count
+    global _captured_color_pair_count
+    global _captured_default_background
+
+    _captured_color_pairs = {}
+    _captured_next_color_pair = CAPTURED_COLOR_PAIR_START
+    _captured_colors_enabled = False
+    _captured_color_count = 0
+    _captured_color_pair_count = 0
+    _captured_default_background = -1
+    palette = {
+        "normal": curses.A_NORMAL,
+        "bold": curses.A_BOLD,
+        "dim": curses.A_DIM,
+        "green": curses.A_BOLD,
+        "recent": curses.A_BOLD,
+        "orange": curses.A_BOLD,
+        "complete": curses.A_DIM,
+        "red": curses.A_BOLD,
+        "cyan": curses.A_BOLD,
+        "busy_0": curses.A_BOLD,
+        "busy_1": curses.A_BOLD,
+        "busy_2": curses.A_BOLD,
+        "busy_3": curses.A_BOLD,
+        "selected": curses.A_BOLD,
+        "topbar": curses.A_BOLD | curses.A_REVERSE,
+        "panel_top": curses.A_BOLD | curses.A_REVERSE,
+        "panel_bottom": curses.A_BOLD | curses.A_REVERSE,
+    }
+    if not enabled or not curses.has_colors():
+        return palette
+
+    curses.start_color()
+    try:
+        curses.use_default_colors()
+        background = -1
+    except curses.error:
+        background = curses.COLOR_BLACK
+    orange = 208 if getattr(curses, "COLORS", 0) > 208 else curses.COLOR_YELLOW
+    color_count = getattr(curses, "COLORS", 0)
+    _captured_colors_enabled = True
+    _captured_color_count = color_count
+    _captured_color_pair_count = getattr(curses, "COLOR_PAIRS", 0)
+    _captured_default_background = background
+    complete = 238 if color_count > 238 else curses.COLOR_BLACK
+    busy_colors = (
+        (75, 69, 99, 135)
+        if color_count > 135
+        else (
+            curses.COLOR_BLUE,
+            curses.COLOR_BLUE,
+            curses.COLOR_MAGENTA,
+            curses.COLOR_MAGENTA,
+        )
+    )
+    topbar_foreground = 255 if color_count > 255 else curses.COLOR_WHITE
+    topbar_background = 17 if color_count > 17 else curses.COLOR_BLUE
+    for pair, foreground in (
+        (1, curses.COLOR_GREEN),
+        (2, orange),
+        (3, curses.COLOR_RED),
+        (4, curses.COLOR_CYAN),
+        (5, busy_colors[0]),
+        (6, busy_colors[1]),
+        (7, busy_colors[2]),
+        (8, busy_colors[3]),
+        (10, complete),
+        (11, curses.COLOR_YELLOW),
+    ):
+        try:
+            curses.init_pair(pair, foreground, background)
+        except curses.error:
+            continue
+    try:
+        curses.init_pair(9, topbar_foreground, topbar_background)
+    except curses.error:
+        pass
+    for pair, foreground, panel_background in (
+        (12, topbar_foreground, 90 if color_count > 90 else curses.COLOR_MAGENTA),
+        (13, curses.COLOR_BLACK, 178 if color_count > 178 else curses.COLOR_YELLOW),
+    ):
+        try:
+            curses.init_pair(pair, foreground, panel_background)
+        except curses.error:
+            pass
+    palette.update(
+        {
+            "green": curses.color_pair(1) | curses.A_BOLD,
+            "recent": curses.color_pair(11) | curses.A_BOLD,
+            "orange": curses.color_pair(2) | curses.A_BOLD,
+            "complete": curses.color_pair(10),
+            "red": curses.color_pair(3) | curses.A_BOLD,
+            "cyan": curses.color_pair(4) | curses.A_BOLD,
+            "busy_0": curses.color_pair(5) | curses.A_BOLD,
+            "busy_1": curses.color_pair(6) | curses.A_BOLD,
+            "busy_2": curses.color_pair(7) | curses.A_BOLD,
+            "busy_3": curses.color_pair(8) | curses.A_BOLD,
+            "selected": curses.color_pair(4) | curses.A_BOLD,
+            "topbar": curses.color_pair(9) | curses.A_BOLD,
+            "panel_top": curses.color_pair(12) | curses.A_BOLD,
+            "panel_bottom": curses.color_pair(13) | curses.A_BOLD,
+        }
+    )
+    return palette
+
+
+def captured_style_attribute(style: TerminalStyle) -> int:
+    global _captured_next_color_pair
+
+    attribute = curses.A_NORMAL
+    foreground: int | None = None
+    background: int = _captured_default_background
+    if _captured_colors_enabled and _captured_color_count > 0:
+        if style.foreground is not None:
+            foreground = nearest_terminal_color(
+                style.foreground, _captured_color_count
+            )
+        if style.background is not None:
+            background = nearest_terminal_color(
+                style.background, _captured_color_count
+            )
+        if foreground is not None or style.background is not None:
+            pair_foreground = foreground if foreground is not None else -1
+            pair_key = (pair_foreground, background)
+            pair = _captured_color_pairs.get(pair_key)
+            if pair is None and _captured_next_color_pair < _captured_color_pair_count:
+                try:
+                    curses.init_pair(
+                        _captured_next_color_pair, pair_foreground, background
+                    )
+                    pair = _captured_next_color_pair
+                    _captured_color_pairs[pair_key] = pair
+                    _captured_next_color_pair += 1
+                except curses.error:
+                    pair = None
+            if pair is not None:
+                attribute |= curses.color_pair(pair)
+
+    if style.bold:
+        attribute |= curses.A_BOLD
+    if style.dim:
+        attribute |= curses.A_DIM
+    if style.italic:
+        attribute |= getattr(curses, "A_ITALIC", 0)
+    if style.underline:
+        attribute |= curses.A_UNDERLINE
+    if style.reverse:
+        attribute |= curses.A_REVERSE
+    if style.strike:
+        attribute |= curses.A_DIM
+    return attribute
+
+
+def curses_add(
+    screen: curses.window,
+    y: int,
+    x: int,
+    value: str,
+    attribute: int = curses.A_NORMAL,
+    max_width: int | None = None,
+) -> int:
+    height, width = screen.getmaxyx()
+    if y < 0 or y >= height or x < 0 or x >= width - 1:
+        return x
+    available = width - x - 1
+    if max_width is not None:
+        available = min(available, max_width)
+    clipped = truncate_display(value, max(0, available))
+    if not clipped:
+        return x
+    try:
+        screen.addstr(y, x, clipped, attribute)
+    except curses.error:
+        return x
+    return x + display_width(clipped)
+
+
+def curses_add_busy(
+    screen: curses.window,
+    y: int,
+    x: int,
+    value: str,
+    palette: dict[str, int],
+    max_width: int | None = None,
+) -> int:
+    """Draw a short blue-to-purple label while preserving table alignment."""
+    available = max_width if max_width is not None else display_width(value)
+    clipped = truncate_display(value, max(0, available))
+    visible_length = len(clipped.rstrip())
+    if visible_length <= 0:
+        return curses_add(screen, y, x, clipped, palette["normal"], available)
+    start_x = x
+    for index, character in enumerate(clipped):
+        if index >= visible_length:
+            attribute = palette["normal"]
+        elif visible_length == 1:
+            attribute = palette["busy_0"]
+        else:
+            color_index = round(index * 3 / (visible_length - 1))
+            attribute = palette[f"busy_{color_index}"]
+        x = curses_add(screen, y, x, character, attribute, 1)
+    return max(x, start_x + display_width(clipped))
+
+
+def preview_style(line: PreviewLine, palette: dict[str, int]) -> int:
+    return {
+        "user": palette["cyan"],
+        "assistant": palette["normal"],
+        "tool": palette["dim"],
+        "working": palette["busy_2"],
+        "addition": palette["green"],
+        "deletion": palette["red"],
+        "meta": palette["dim"],
+        "body": palette["normal"],
+    }.get(line.kind, palette["dim"])
+
+
+def truncate_preview_line(line: PreviewLine, width: int) -> PreviewLine:
+    clipped = truncate_display(line.text, width)
+    if clipped == line.text:
+        return line
+    if not line.spans:
+        return replace(line, text=clipped)
+    suffix_length = 3 if clipped.endswith("...") else 0
+    prefix_end = max(0, len(clipped) - suffix_length)
+    spans = preview_span_slice(
+        line,
+        0,
+        prefix_end,
+        0,
+        materialize_default=True,
+    )
+    if suffix_length:
+        suffix_style = preview_style_at(line, max(0, prefix_end - 1))
+        spans.append(
+            PreviewSpan(prefix_end, len(clipped), suffix_style)
+        )
+    return replace(line, text=clipped, spans=merge_preview_spans(spans))
+
+
+def preview_line_with_prefix(
+    line: PreviewLine, prefix: str, *, strip_leading: bool = False
+) -> PreviewLine:
+    start = len(line.text) - len(line.text.lstrip()) if strip_leading else 0
+    text = prefix + line.text[start:]
+    if not line.spans:
+        return replace(line, text=text)
+    spans = [PreviewSpan(0, len(prefix), TerminalStyle())] if prefix else []
+    spans.extend(
+        preview_span_slice(
+            line,
+            start,
+            len(line.text),
+            len(prefix),
+            materialize_default=True,
+        )
+    )
+    return replace(line, text=text, spans=merge_preview_spans(spans))
+
+
+def wrap_preview_line(line: PreviewLine, width: int) -> list[PreviewLine]:
+    if line.kind == "blank":
+        return [line]
+    if line.kind == "separator":
+        return [PreviewLine("─", "separator")]
+
+    content = line.text.lstrip(" ")
+    indentation = " " * min(8, len(line.text) - len(content))
+    if not content:
+        return [PreviewLine("", "blank")]
+    continuation_indent = indentation + "  "
+    wrapper = textwrap.TextWrapper(
+        width=max(8, width),
+        initial_indent=indentation,
+        subsequent_indent=continuation_indent,
+        break_long_words=True,
+        break_on_hyphens=False,
+        replace_whitespace=False,
+        drop_whitespace=True,
+    )
+    parts = wrapper.wrap(content) or [indentation]
+    wrapped: list[PreviewLine] = []
+    content_cursor = 0
+    content_start = len(line.text) - len(content)
+    for index, part in enumerate(parts):
+        prefix = indentation if index == 0 else continuation_indent
+        body = part[len(prefix) :] if part.startswith(prefix) else part.lstrip()
+        body_offset = content.find(body, content_cursor)
+        if body_offset < 0:
+            body_offset = content_cursor
+        body_end = min(len(content), body_offset + len(body))
+        content_cursor = body_end
+        spans: tuple[PreviewSpan, ...] = ()
+        if line.spans:
+            span_list = (
+                preview_span_slice(
+                    line,
+                    0,
+                    content_start,
+                    0,
+                    materialize_default=True,
+                )
+                if index == 0
+                else [PreviewSpan(0, len(prefix), TerminalStyle())]
+            )
+            span_list.extend(
+                preview_span_slice(
+                    line,
+                    content_start + body_offset,
+                    content_start + body_end,
+                    len(prefix),
+                    materialize_default=True,
+                )
+            )
+            spans = merge_preview_spans(span_list)
+        wrapped.append(
+            truncate_preview_line(
+                PreviewLine(part, line.kind, index > 0, spans), width
+            )
+        )
+    return wrapped
+
+
+def wrap_preview_lines(
+    lines: tuple[PreviewLine, ...], width: int
+) -> tuple[PreviewLine, ...]:
+    wrapped: list[PreviewLine] = []
+    for line in lines:
+        wrapped.extend(wrap_preview_line(line, width))
+    return tuple(wrapped)
+
+
+def preview_window_from_wrapped(
+    wrapped: tuple[PreviewLine, ...],
+    rows: int,
+    scroll_offset: int = 0,
+) -> tuple[list[PreviewLine], int, int]:
+    if rows <= 0:
+        return [], 0, 0
+    if not wrapped:
+        return [], 0, 0
+
+    max_offset = max(0, len(wrapped) - max(1, rows - 1))
+    offset = max(0, min(scroll_offset, max_offset))
+    end = max(0, len(wrapped) - offset)
+    newer_hidden = end < len(wrapped)
+    available = max(0, rows - (1 if newer_hidden else 0))
+    start = max(0, end - available)
+    older_hidden = start > 0
+    if older_hidden:
+        available = max(0, available - 1)
+        start = max(0, end - available)
+
+    shown = list(wrapped[start:end])
+    while len(shown) > 1 and shown[0].continuation:
+        shown.pop(0)
+    if shown and shown[0].continuation:
+        shown[0] = replace(
+            preview_line_with_prefix(shown[0], "... ", strip_leading=True),
+            continuation=False,
+        )
+    result: list[PreviewLine] = []
+    if older_hidden:
+        result.append(PreviewLine("… earlier transcript", "meta"))
+    result.extend(shown)
+    if newer_hidden:
+        result.append(PreviewLine("… newer transcript below", "meta"))
+    return result[-rows:], offset, max_offset
+
+
+def preview_window(
+    lines: tuple[PreviewLine, ...],
+    width: int,
+    rows: int,
+    scroll_offset: int = 0,
+) -> tuple[list[PreviewLine], int, int]:
+    if width <= 0 or rows <= 0:
+        return [], 0, 0
+    return preview_window_from_wrapped(
+        wrap_preview_lines(lines, width), rows, scroll_offset
+    )
+
+
+def wrapped_preview(
+    lines: tuple[PreviewLine, ...],
+    width: int,
+    rows: int,
+    scroll_offset: int = 0,
+) -> list[PreviewLine]:
+    return preview_window(lines, width, rows, scroll_offset)[0]
+
+
+def draw_section_heading(
+    screen: curses.window,
+    y: int,
+    width: int,
+    title: str,
+    palette: dict[str, int],
+    *,
+    x: int = 0,
+    style: str | None = None,
+) -> None:
+    attribute = palette[style] if style else palette["bold"]
+    curses_add(screen, y, x, " " * width, attribute, width)
+    curses_add(screen, y, x + 1, title, attribute, max(1, width - 2))
+
+
+def draw_preview_line(
+    screen: curses.window,
+    y: int,
+    x: int,
+    line: PreviewLine,
+    width: int,
+    palette: dict[str, int],
+    status_attribute: int | None = None,
+) -> None:
+    if line.kind == "blank":
+        return
+    if line.kind == "working" and status_attribute is not None:
+        # Reuse the parsed line kind, including wrapped status continuations.
+        # Native dim styling must not obscure the panel's identifying color.
+        curses_add(
+            screen, y, max(0, x - 1), " " * (width + 2), status_attribute, width + 2
+        )
+        curses_add(screen, y, x, line.text, status_attribute, width)
+        return
+    if line.kind == "separator":
+        try:
+            screen.addstr(y, x, "─" * width, palette["dim"])
+        except curses.error:
+            pass
+        return
+    if not line.spans:
+        curses_add(screen, y, x, line.text, preview_style(line, palette), width)
+        return
+
+    cursor = 0
+    draw_x = x
+    end_x = x + width
+    fallback = preview_style(line, palette)
+    for span in line.spans:
+        if draw_x >= end_x:
+            break
+        if span.start > cursor:
+            draw_x = curses_add(
+                screen,
+                y,
+                draw_x,
+                line.text[cursor : span.start],
+                fallback,
+                end_x - draw_x,
+            )
+        draw_x = curses_add(
+            screen,
+            y,
+            draw_x,
+            line.text[span.start : span.end],
+            captured_style_attribute(span.style),
+            end_x - draw_x,
+        )
+        cursor = max(cursor, span.end)
+    if cursor < len(line.text) and draw_x < end_x:
+        curses_add(
+            screen,
+            y,
+            draw_x,
+            line.text[cursor:],
+            fallback,
+            end_x - draw_x,
+        )
+
+
+def selected_workspace_index(
+    workspaces: list[Workspace], selected_session_id: str | None
+) -> int:
+    if not workspaces:
+        return 0
+    for index, workspace in enumerate(workspaces):
+        if workspace.session.session_id == selected_session_id:
+            return index
+    return 0
+
+
+def dashboard_slot_count(state: DashboardState) -> int:
+    return 2 if state.split_view else 1
+
+
+def dashboard_active_session_id(state: DashboardState) -> str | None:
+    slot = max(0, min(dashboard_slot_count(state) - 1, state.active_slot))
+    return state.selected_session_ids[slot]
+
+
+def dashboard_displayed_session_ids(state: DashboardState) -> tuple[str, ...]:
+    return tuple(
+        session_id
+        for session_id in state.selected_session_ids[: dashboard_slot_count(state)]
+        if session_id is not None
+    )
+
+
+def dashboard_focus_modes(split_view: bool) -> tuple[str, ...]:
+    """Return the horizontal control modes available in the current view."""
+    return ("window", "nav", "compose") if split_view else ("nav", "compose")
+
+
+def dashboard_focus_step(focus: str, split_view: bool, delta: int) -> str:
+    """Move left or right through the control modes without wrapping."""
+    modes = dashboard_focus_modes(split_view)
+    try:
+        index = modes.index(focus)
+    except ValueError:
+        index = 0
+    return modes[max(0, min(len(modes) - 1, index + delta))]
+
+
+def dashboard_vertical_context(focus: str, split_view: bool) -> str:
+    """Identify what Up/Down and wheel gestures control in this mode."""
+    if focus == "window":
+        return "window" if split_view else "workspace"
+    if focus == "nav":
+        return "workspace"
+    return "preview"
+
+
+def dashboard_focus_chip_ranges(
+    panel_x: int, split_view: bool
+) -> tuple[tuple[str, int, int], ...]:
+    """Return the inclusive/exclusive x ranges used by clickable mode chips."""
+    cursor_x = panel_x + 1
+    ranges: list[tuple[str, int, int]] = []
+    for mode in dashboard_focus_modes(split_view):
+        end_x = cursor_x + len(DASHBOARD_FOCUS_LABELS[mode])
+        ranges.append((mode, cursor_x, end_x))
+        cursor_x = end_x + 1
+    return tuple(ranges)
+
+
+def dashboard_focus_at_x(
+    panel_x: int, split_view: bool, mouse_x: int
+) -> str | None:
+    for mode, start_x, end_x in dashboard_focus_chip_ranges(
+        panel_x, split_view
+    ):
+        if start_x <= mouse_x < end_x:
+            return mode
+    return None
+
+
+def dashboard_table_capacity(height: int, split_view: bool = False) -> int:
+    # Reserve chat headings, readable transcripts, one control row, and a gutter.
+    reserved_rows = 15 if split_view else 11
+    return max(1, min(12, height - reserved_rows))
+
+
+def dashboard_workspace_bottom(
+    height: int, workspace_count: int, split_view: bool = False,
+    collapsed: bool = False,
+) -> int:
+    if collapsed:
+        return 1
+    table_capacity = dashboard_table_capacity(height, split_view)
+    return 3 + min(workspace_count, table_capacity)
+
+
+def dashboard_panel_geometries(
+    usable_width: int,
+    height: int,
+    workspace_bottom: int,
+    split_view: bool,
+    active_slot: int = 0,
+) -> tuple[DashboardPanelGeometry, ...]:
+    chat_top = workspace_bottom + 1
+    if not split_view:
+        return (
+            DashboardPanelGeometry(
+                x=0,
+                width=usable_width,
+                chat_top=chat_top,
+                chat_bottom=height - 3,
+                composer_top=height - 2,
+                composer_middle=height - 2,
+                composer_bottom=height - 2,
+            ),
+        )
+
+    region_bottom = height - 2
+    gap = 1
+    available_rows = max(2, region_bottom - chat_top + 1 - gap)
+    top_rows = available_rows // 2
+    bottom_rows = available_rows - top_rows
+    regions = (
+        (chat_top, chat_top + top_rows - 1),
+        (chat_top + top_rows + gap, chat_top + top_rows + gap + bottom_rows - 1),
+    )
+    return tuple(
+        DashboardPanelGeometry(
+            x=0,
+            width=usable_width,
+            chat_top=region_top,
+            chat_bottom=region_end - 1 if slot == active_slot else region_end,
+            composer_top=region_end if slot == active_slot else -1,
+            composer_middle=region_end if slot == active_slot else -1,
+            composer_bottom=region_end if slot == active_slot else -1,
+        )
+        for slot, (region_top, region_end) in enumerate(regions)
+    )
+
+
+def default_workspace_session_id(workspaces: list[Workspace]) -> str | None:
+    if not workspaces:
+        return None
+    selected = max(
+        workspaces,
+        key=lambda workspace: (
+            bool(workspace.session.attached and workspace.state == "busy"),
+            workspace.state == "busy",
+            bool(workspace.session.attached),
+            workspace.last_activity or 0,
+        ),
+    )
+    return selected.session.session_id
+
+
+def draw_chat_panel(
+    screen: curses.window,
+    workspace: Workspace,
+    dashboard_state: DashboardState,
+    palette: dict[str, int],
+    now: float,
+    *,
+    x: int,
+    width: int,
+    top: int,
+    bottom: int,
+    label: str,
+    active: bool,
+) -> None:
+    inner_x = x + 1
+    inner_width = max(1, width - 2)
+    title = (
+        f"{label} / {safe_label(workspace.session.name)} / "
+        f"{workspace_subject(workspace)}"
+    )
+    panel_style = "panel_bottom" if label == "BOTTOM" else "panel_top"
+    draw_section_heading(
+        screen, top, width, title, palette, x=x,
+        style=panel_style,
+    )
+    meta_y = top + 1
+    preview_start = meta_y + 1
+    preview_rows = max(0, bottom - preview_start + 1)
+    requested_scroll = dashboard_state.preview_scroll.get(
+        workspace.session.session_id, 0
+    )
+    layout = dashboard_state.preview_layouts.get(workspace.session.session_id)
+    if (
+        layout is None
+        or layout.source is not workspace.preview
+        or layout.width != inner_width
+    ):
+        layout = PreviewLayout(
+            workspace.preview,
+            inner_width,
+            wrap_preview_lines(workspace.preview, inner_width),
+        )
+        dashboard_state.preview_layouts[workspace.session.session_id] = layout
+    preview, scroll_offset, _ = preview_window_from_wrapped(
+        layout.wrapped,
+        preview_rows,
+        requested_scroll,
+    )
+    dashboard_state.preview_scroll[workspace.session.session_id] = scroll_offset
+    cursor_x = inner_x
+    cursor_x = curses_add(
+        screen, meta_y, cursor_x, workspace.app.upper(), palette["cyan"]
+    )
+    cursor_x = curses_add(screen, meta_y, cursor_x, "  ", palette["normal"])
+    tier = activity_tier(workspace.last_activity, workspace.state, now)
+    state_field = lifecycle_label(workspace.state, tier).upper()
+    if tier == "busy":
+        cursor_x = curses_add_busy(
+            screen, meta_y, cursor_x, state_field, palette
+        )
+    else:
+        cursor_x = curses_add(
+            screen,
+            meta_y,
+            cursor_x,
+            state_field,
+            palette.get(tier, palette["dim"]),
+        )
+    cursor_x = curses_add(screen, meta_y, cursor_x, "  ", palette["normal"])
+    age = format_activity_age(workspace.last_activity, now)
+    cursor_x = curses_add(
+        screen,
+        meta_y,
+        cursor_x,
+        age,
+        palette["busy_0"] if tier == "busy" else palette.get(tier, palette["dim"]),
+        max(0, x + width - cursor_x - 2),
+    )
+    if workspace.state == "busy" and x + width - cursor_x > 10:
+        cursor_x = curses_add(screen, meta_y, cursor_x, "  ", palette["normal"])
+        curses_add(
+            screen,
+            meta_y,
+            cursor_x,
+            format_elapsed(workspace.busy_seconds),
+            palette["busy_3"],
+            max(0, x + width - cursor_x - 2),
+        )
+    view_label = "LIVE" if scroll_offset == 0 else f"+{scroll_offset}"
+    view_x = x + width - display_width(view_label) - 3
+    if view_x > cursor_x + 1:
+        curses_add(
+            screen,
+            meta_y,
+            view_x,
+            view_label,
+            palette["busy_0"] if scroll_offset == 0 else palette["orange"],
+        )
+
+    preview_y = preview_start + max(0, preview_rows - len(preview))
+    for offset, line in enumerate(preview):
+        draw_preview_line(
+            screen,
+            preview_y + offset,
+            inner_x,
+            line,
+            inner_width,
+            palette,
+            status_attribute=palette[panel_style],
+        )
+    if not preview and preview_rows:
+        curses_add(
+            screen,
+            preview_start,
+            inner_x,
+            "No safe transcript yet.",
+            palette["dim"],
+            inner_width,
+        )
+
+
+def dashboard_draft(
+    state: DashboardState, session_id: str
+) -> tuple[str, int, dict[str, str]]:
+    if state.active_draft_session == session_id:
+        return state.text, state.cursor, state.paste_payloads
+    text = state.drafts.get(session_id, "")
+    return (
+        text,
+        min(len(text), state.draft_cursors.get(session_id, len(text))),
+        state.draft_paste_payloads.get(session_id, {}),
+    )
+
+
+def draw_composer_panel(
+    screen: curses.window,
+    workspace: Workspace,
+    dashboard_state: DashboardState,
+    palette: dict[str, int],
+    *,
+    x: int,
+    width: int,
+    middle: int,
+    label: str,
+    active: bool,
+) -> tuple[int, int] | None:
+    sending_here = (
+        dashboard_state.sending
+        and dashboard_state.inflight_session == workspace.session.session_id
+    )
+    cursor_x = x + 1
+    modes = dashboard_focus_modes(dashboard_state.split_view)
+    for index, mode in enumerate(modes):
+        chip_attribute = (
+            palette["topbar"]
+            if active and dashboard_state.focus == mode
+            else palette["dim"]
+        )
+        cursor_x = curses_add(
+            screen,
+            middle,
+            cursor_x,
+            DASHBOARD_FOCUS_LABELS[mode],
+            chip_attribute,
+        )
+        if index < len(modes) - 1:
+            cursor_x = curses_add(
+                screen, middle, cursor_x, " ", palette["normal"]
+            )
+
+    if active and dashboard_state.focus == "window":
+        hint = f"  {label} ACTIVE · Up/Down panels"
+        curses_add(
+            screen,
+            middle,
+            cursor_x,
+            hint,
+            palette["selected"],
+            max(1, x + width - cursor_x - 1),
+        )
+        return None
+
+    if active and dashboard_state.focus == "nav":
+        cursor_x = curses_add(screen, middle, cursor_x, "  ", palette["normal"])
+        selector = dashboard_state.selector or "_"
+        cursor_x = curses_add(
+            screen, middle, cursor_x, selector, palette["selected"]
+        )
+        hint = "  Up/Down or number"
+        curses_add(
+            screen,
+            middle,
+            cursor_x,
+            hint,
+            palette["dim"],
+            max(1, x + width - cursor_x - 1),
+        )
+        return None
+
+    text, text_cursor, paste_payloads = dashboard_draft(
+        dashboard_state, workspace.session.session_id
+    )
+    cursor_x = curses_add(screen, middle, cursor_x, " › ", palette["cyan"])
+    input_width = max(1, x + width - cursor_x - 1)
+    visible, cursor_column = composer_display_window(
+        text, text_cursor, input_width, paste_payloads
+    )
+    if visible:
+        curses_add(
+            screen,
+            middle,
+            cursor_x,
+            visible,
+            palette["dim"] if sending_here or not active else palette["normal"],
+            input_width,
+        )
+    elif active and dashboard_state.focus == "compose" and not sending_here:
+        curses_add(
+            screen,
+            middle,
+            cursor_x,
+            "Type or paste, then Enter",
+            palette["dim"],
+            input_width,
+        )
+    elif not active:
+        curses_add(
+            screen,
+            middle,
+            cursor_x,
+            "Select this pane to type",
+            palette["dim"],
+            input_width,
+        )
+    if active and dashboard_state.focus == "compose" and not sending_here:
+        return (middle, min(cursor_x + cursor_column, x + width - 1))
+    return None
+
+
+def draw_dashboard(
+    screen: curses.window,
+    workspaces: list[Workspace],
+    dashboard_state: DashboardState,
+    palette: dict[str, int],
+    interval: float,
+    error: str | None,
+    now: float,
+) -> None:
+    screen.erase()
+    height, width = screen.getmaxyx()
+    usable_width = max(1, width - 1)
+    attached_total = sum(workspace.session.attached for workspace in workspaces)
+    topbar_left = " TMUXIUS" + (" | DEMO" if dashboard_state.demo_mode else "")
+    topbar_right = f"LIVE  {time.strftime('%H:%M:%S')} "
+    topbar_gap = max(1, usable_width - len(topbar_left) - len(topbar_right))
+    topbar = truncate_display(
+        f"{topbar_left}{' ' * topbar_gap}{topbar_right}", usable_width
+    )
+    topbar = topbar + " " * max(0, usable_width - display_width(topbar))
+    try:
+        screen.addstr(0, 0, topbar, palette["topbar"])
+    except curses.error:
+        pass
+
+    x = 1
+    x = curses_add(screen, 1, x, str(len(workspaces)), palette["bold"])
+    x = curses_add(screen, 1, x, " workspaces | ", palette["dim"])
+    x = curses_add(screen, 1, x, str(attached_total), palette["green"])
+    view_mode = "STACKED" if dashboard_state.split_view else "ONE"
+    status_suffix = (
+        f" attached | {interval:g}s live | {view_mode} | INPUT"
+        if usable_width < 60
+        else f" attached | {interval:g}s live | {view_mode} VIEW | INTERACTIVE"
+    )
+    x = curses_add(
+        screen,
+        1,
+        x,
+        status_suffix,
+        palette["dim"],
+    )
+    legend_width = 35
+    legend_x = usable_width - legend_width
+    if legend_x > x + 1:
+        x = legend_x
+        x = curses_add(screen, 1, x, "G <=10m", palette["green"])
+        x = curses_add(screen, 1, x, "  Y 10-30m", palette["recent"])
+        x = curses_add(screen, 1, x, "  O 30-60m", palette["orange"])
+        curses_add(screen, 1, x, "  D >60m", palette["complete"])
+
+    if error:
+        draw_section_heading(screen, 3, usable_width, "TMUX UNAVAILABLE", palette)
+        curses_add(
+            screen,
+            4,
+            2,
+            error,
+            palette["red"],
+            max(1, usable_width - 4),
+        )
+        screen.noutrefresh()
+        curses.doupdate()
+        return
+    if not workspaces:
+        draw_section_heading(screen, 3, usable_width, "WORKSPACES", palette)
+        curses_add(
+            screen,
+            4,
+            2,
+            "No tmux workspaces to monitor.",
+            palette["dim"],
+            max(1, usable_width - 4),
+        )
+        screen.noutrefresh()
+        curses.doupdate()
+        return
+    minimum_height = 16 if dashboard_state.split_view else 10
+    if height < minimum_height or width < 52:
+        curses_add(
+            screen,
+            3,
+            1,
+            (
+                f"Resize to at least 52 columns and {minimum_height} rows "
+                "for this dashboard."
+            ),
+            palette["orange"],
+            max(1, usable_width - 2),
+        )
+        screen.noutrefresh()
+        curses.doupdate()
+        return
+
+    if dashboard_state.workspaces_collapsed:
+        workspace_bottom = 1
+    else:
+        active_session_id = dashboard_active_session_id(dashboard_state)
+        selected_index = selected_workspace_index(workspaces, active_session_id)
+        session_width = max(
+            2,
+            min(
+                10,
+                max(
+                    display_width(truncate_display(safe_label(item.session.name), 10))
+                    for item in workspaces
+                ),
+            ),
+        )
+        panel_width = usable_width
+        inner_x = 1
+        inner_width = max(1, panel_width - 2)
+        show_working = inner_width >= 65
+        table_capacity = dashboard_table_capacity(height, dashboard_state.split_view)
+        table_count = min(len(workspaces), table_capacity)
+        first = max(
+            0,
+            min(
+                selected_index - table_count // 2,
+                max(0, len(workspaces) - table_count),
+            ),
+        )
+        shown = workspaces[first : first + table_count]
+        workspace_top = 2
+        header_y = workspace_top + 1
+        row_start = header_y + 1
+        workspace_bottom = row_start + len(shown) - 1
+        draw_section_heading(
+            screen,
+            workspace_top,
+            panel_width,
+            f"WORKSPACES {len(workspaces)} / {attached_total} ATTACHED",
+            palette,
+        )
+        x = inner_x
+        x = curses_add(screen, header_y, x, "  ", palette["dim"], 2)
+        x = curses_add(
+            screen,
+            header_y,
+            x,
+            display_field("ID", session_width, align_right=True),
+            palette["dim"],
+            session_width,
+        )
+        x = curses_add(
+            screen,
+            header_y,
+            x,
+            "  ATT  AGENT    STATUS     LAST     ",
+            palette["dim"],
+        )
+        if show_working:
+            x = curses_add(screen, header_y, x, "RUN      ", palette["dim"])
+        curses_add(screen, header_y, x, "SUBJECT", palette["dim"])
+
+        for row_offset, workspace in enumerate(shown):
+            y = row_start + row_offset
+            selected_slots = [
+                slot
+                for slot, session_id in enumerate(
+                    dashboard_state.selected_session_ids[
+                        : dashboard_slot_count(dashboard_state)
+                    ]
+                )
+                if workspace.session.session_id == session_id
+            ]
+            selected = bool(selected_slots)
+            active_selected = workspace.session.session_id == active_session_id
+            tier = activity_tier(workspace.last_activity, workspace.state, now)
+            tier_attribute = palette.get(tier, palette["dim"])
+            x = inner_x
+            x = curses_add(
+                screen,
+                y,
+                x,
+                (
+                    "> "
+                    if active_selected
+                    else ("T " if selected_slots == [0] else "B ")
+                    if selected
+                    else "  "
+                ),
+                palette["selected"] if selected else palette["dim"],
+                2,
+            )
+            name = display_field(
+                safe_label(workspace.session.name), session_width, align_right=True
+            )
+            x = curses_add(
+                screen,
+                y,
+                x,
+                name,
+                palette["selected"] if selected else palette["cyan"],
+                session_width,
+            )
+            marker = "yes" if workspace.session.attached else "--"
+            x = curses_add(screen, y, x, "  ", palette["normal"], 2)
+            x = curses_add(
+                screen,
+                y,
+                x,
+                marker,
+                palette["green"] if workspace.session.attached else palette["dim"],
+                3,
+            )
+            x = curses_add(screen, y, x, "  ", palette["normal"], 2)
+            x = curses_add(
+                screen,
+                y,
+                x,
+                display_field(workspace.app, 7),
+                palette["normal"],
+                7,
+            )
+            x = curses_add(screen, y, x, "  ", palette["normal"], 2)
+            state_field = display_field(
+                lifecycle_label(workspace.state, tier).upper(), 9
+            )
+            if tier == "busy":
+                x = curses_add_busy(screen, y, x, state_field, palette, 9)
+            else:
+                x = curses_add(screen, y, x, state_field, tier_attribute, 9)
+            x = curses_add(screen, y, x, "  ", palette["normal"], 2)
+            age = display_field(format_activity_age(workspace.last_activity, now), 7)
+            age_attribute = palette["busy_0"] if tier == "busy" else tier_attribute
+            x = curses_add(screen, y, x, age, age_attribute, 7)
+            x = curses_add(screen, y, x, "  ", palette["normal"], 2)
+            if show_working:
+                duration = (
+                    format_elapsed(workspace.busy_seconds)
+                    if workspace.state == "busy"
+                    else "-"
+                )
+                x = curses_add(
+                    screen,
+                    y,
+                    x,
+                    display_field(duration, 7),
+                    palette["busy_3"]
+                    if workspace.state == "busy"
+                    else palette["dim"],
+                    7,
+                )
+                x = curses_add(screen, y, x, "  ", palette["normal"], 2)
+            title_attribute = palette["bold"] if active_selected else palette["normal"]
+            curses_add(
+                screen,
+                y,
+                x,
+                workspace_subject(workspace),
+                title_attribute,
+                max(1, panel_width - x - 2),
+            )
+
+    cursor_position: tuple[int, int] | None = None
+    workspace_by_id = {
+        workspace.session.session_id: workspace for workspace in workspaces
+    }
+    geometries = dashboard_panel_geometries(
+        usable_width,
+        height,
+        workspace_bottom,
+        dashboard_state.split_view,
+        dashboard_state.active_slot,
+    )
+    labels = ("TOP", "BOTTOM") if dashboard_state.split_view else ("LIVE CHAT",)
+    for slot, geometry in enumerate(geometries):
+        session_id = dashboard_state.selected_session_ids[slot]
+        workspace = workspace_by_id.get(session_id or "")
+        if workspace is None:
+            continue
+        active = slot == dashboard_state.active_slot
+        draw_chat_panel(
+            screen,
+            workspace,
+            dashboard_state,
+            palette,
+            now,
+            x=geometry.x,
+            width=geometry.width,
+            top=geometry.chat_top,
+            bottom=geometry.chat_bottom,
+            label=labels[slot],
+            active=active,
+        )
+        if active:
+            panel_cursor = draw_composer_panel(
+                screen,
+                workspace,
+                dashboard_state,
+                palette,
+                x=geometry.x,
+                width=geometry.width,
+                middle=geometry.composer_middle,
+                label=labels[slot],
+                active=True,
+            )
+            if panel_cursor is not None:
+                cursor_position = panel_cursor
+
+    footer_y = height - 1
+    if dashboard_state.status:
+        footer_text = dashboard_state.status
+        footer_attribute = palette.get(dashboard_state.status_kind, palette["dim"])
+    elif dashboard_state.focus == "window" and dashboard_state.split_view:
+        footer_text = (
+            "WINDOW  |  c workspaces  |  Up/Down/Scroll top/bottom  |  Right Select ID  |  "
+            "Tab toggle  |  s one  |  q quit"
+        )
+        footer_attribute = palette["selected"]
+    elif dashboard_state.focus == "nav" and dashboard_state.split_view:
+        footer_text = (
+            "SELECT ID  |  c workspaces  |  Left Window  |  Up/Down/Scroll workspace  |  "
+            "number ID  |  Right Message  |  s one"
+        )
+        footer_attribute = palette["busy_0"]
+    elif dashboard_state.focus == "nav":
+        footer_text = (
+            "SELECT ID  |  c workspaces  |  Up/Down/Scroll workspace  |  number ID  |  "
+            "Right Message  |  s stacked  |  q quit"
+        )
+        footer_attribute = palette["busy_0"]
+    else:
+        footer_text = (
+            "MESSAGE  |  Enter send/steer  |  Left at start Select ID  |  "
+            "Up/Down/Scroll chat"
+        )
+        if dashboard_state.split_view:
+            footer_text += "  |  Tab top/bottom"
+        else:
+            footer_text += "  |  Esc IDs"
+        footer_attribute = palette["dim"]
+    curses_add(
+        screen,
+        footer_y,
+        1,
+        footer_text,
+        footer_attribute,
+        max(1, usable_width - 2),
+    )
+    try:
+        curses.curs_set(1 if cursor_position else 0)
+        if cursor_position:
+            screen.move(*cursor_position)
+    except curses.error:
+        pass
+    screen.noutrefresh()
+    curses.doupdate()
+
+
+def set_dashboard_status(
+    state: DashboardState,
+    text: str,
+    kind: str = "dim",
+    duration: float = 5.0,
+) -> None:
+    state.status = text
+    state.status_kind = kind
+    state.status_until = time.monotonic() + duration
+
+
+def locate_tmux_communication_helper() -> Path:
+    script_path = Path(__file__).resolve()
+    candidates = [
+        script_path.parent / "lib/tmux_communication.py",
+        script_path.parent.parent / "share/tmuxius/tmux_communication.py",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError("verified tmux communication helper is unavailable")
+
+
+def send_failure_detail(stdout: str, stderr: str) -> str:
+    lines = [clean_text(line) for line in f"{stderr}\n{stdout}".splitlines()]
+    lines = [line for line in lines if line]
+    for line in reversed(lines):
+        lowered = line.casefold()
+        if any(
+            phrase in lowered
+            for phrase in (
+                "refusing to send-user",
+                "composer changed",
+                "submission unverified",
+                "outbound payload",
+                "tmux buffer differs",
+            )
+        ):
+            return truncate_display(line, 120)
+    return "verified submission failed; inspect the live chat before retrying"
+
+
+def submit_dashboard_message(
+    socket: str | None,
+    workspace: Workspace,
+    message: str,
+    results: queue.Queue[SendResult],
+) -> None:
+    try:
+        helper = locate_tmux_communication_helper()
+        resolved_socket = socket or run_tmux(
+            None,
+            "display-message",
+            "-p",
+            "-t",
+            workspace.pane_id,
+            "#{socket_path}",
+        ).strip()
+        if not resolved_socket:
+            raise TmuxError("tmux socket path could not be resolved")
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(helper),
+                "--socket",
+                resolved_socket,
+                "--target",
+                workspace.pane_id,
+                "send-user",
+                "--lines",
+                "40",
+            ],
+            input=message,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+        if result.returncode == 0 and "USER_MESSAGE_SUBMITTED" in result.stdout:
+            results.put(
+                SendResult(True, workspace.session.session_id, "exact message submitted")
+            )
+            return
+        results.put(
+            SendResult(
+                False,
+                workspace.session.session_id,
+                send_failure_detail(result.stdout, result.stderr),
+            )
+        )
+    except subprocess.TimeoutExpired:
+        results.put(
+            SendResult(
+                False,
+                workspace.session.session_id,
+                "submission proof timed out; inspect chat before retrying",
+            )
+        )
+    except (OSError, TmuxError, FileNotFoundError) as exc:
+        results.put(
+            SendResult(
+                False,
+                workspace.session.session_id,
+                truncate_display(clean_text(str(exc)) or "submission failed", 120),
+            )
+        )
+
+
+def move_workspace_selection(
+    workspaces: list[Workspace], selected_session_id: str | None, delta: int
+) -> str | None:
+    if not workspaces:
+        return None
+    index = selected_workspace_index(workspaces, selected_session_id)
+    return workspaces[(index + delta) % len(workspaces)].session.session_id
+
+
+def activate_workspace_input(
+    state: DashboardState, session_id: str | None
+) -> None:
+    previous = state.active_draft_session
+    if previous is not None:
+        state.drafts[previous] = state.text
+        state.draft_cursors[previous] = state.cursor
+        state.draft_paste_payloads[previous] = dict(state.paste_payloads)
+    state.active_draft_session = session_id
+    if session_id is None:
+        state.text = ""
+        state.cursor = 0
+        state.paste_payloads = {}
+        return
+    state.text = state.drafts.get(session_id, "")
+    state.cursor = min(
+        len(state.text), state.draft_cursors.get(session_id, len(state.text))
+    )
+    state.paste_payloads = dict(state.draft_paste_payloads.get(session_id, {}))
+
+
+def read_bracketed_paste(screen: curses.window) -> PasteReadResult | None:
+    """Read one complete bracketed paste after its leading Escape was consumed."""
+    start = "[200~"
+    end = "\x1b[201~"
+    prefix: list[object] = []
+    try:
+        screen.timeout(400)
+        for expected in start:
+            received = screen.get_wch()
+            prefix.append(received)
+            if received != expected:
+                for key in reversed(prefix):
+                    replay_curses_key(key)
+                return None
+        screen.timeout(250)
+        collected: list[str] = []
+        tail = ""
+        too_large = False
+        complete = False
+        idle_deadline = time.monotonic() + BRACKETED_PASTE_IDLE_SECONDS
+        while True:
+            try:
+                received = screen.get_wch()
+            except curses.error:
+                if time.monotonic() >= idle_deadline:
+                    break
+                continue
+            if not isinstance(received, str):
+                continue
+            idle_deadline = time.monotonic() + BRACKETED_PASTE_IDLE_SECONDS
+            if not too_large:
+                collected.append(received)
+                if len(collected) > MAX_MESSAGE_CHARS + len(end):
+                    too_large = True
+                    collected.clear()
+            tail = (tail + received)[-len(end) :]
+            if tail == end:
+                complete = True
+                break
+        if not complete:
+            return PasteReadResult("", complete=False, too_large=too_large)
+        if too_large:
+            return PasteReadResult("", too_large=True)
+        raw = "".join(collected)
+        if raw.endswith(end):
+            raw = raw[: -len(end)]
+        cleaned = sanitize_composer_input(raw)
+        return PasteReadResult(
+            cleaned,
+            too_large=len(cleaned) > MAX_MESSAGE_CHARS,
+        )
+    except curses.error:
+        for key in reversed(prefix):
+            replay_curses_key(key)
+        return None
+    finally:
+        screen.timeout(100)
+
+
+def paste_burst_character(key: object) -> str | None:
+    if not isinstance(key, str) or len(key) != 1:
+        return None
+    if key in {"\n", "\r"}:
+        return "\n"
+    if key == "\t" or key.isprintable():
+        return key
+    return None
+
+
+def replay_curses_key(key: object) -> None:
+    try:
+        if isinstance(key, str):
+            curses.unget_wch(key)
+        elif isinstance(key, int):
+            curses.ungetch(key)
+    except curses.error:
+        pass
+
+
+def read_unbracketed_paste_burst(
+    screen: curses.window, first_key: object
+) -> PasteReadResult | None:
+    """Collapse a rapid non-bracketed key burst before Enter can submit it."""
+    first = paste_burst_character(first_key)
+    if first is None or first == "\n":
+        return None
+    try:
+        screen.timeout(max(1, round(PASTE_BURST_CHAR_INTERVAL_SECONDS * 1000)))
+        try:
+            second_key = screen.get_wch()
+        except curses.error:
+            return None
+        second = paste_burst_character(second_key)
+        if second is None:
+            replay_curses_key(second_key)
+            return None
+
+        collected = [first, second]
+        too_large = len(collected) > MAX_MESSAGE_CHARS
+        screen.timeout(max(1, round(PASTE_BURST_IDLE_SECONDS * 1000)))
+        while True:
+            try:
+                key = screen.get_wch()
+            except curses.error:
+                break
+            character = paste_burst_character(key)
+            if character is None:
+                replay_curses_key(key)
+                break
+            if not too_large:
+                collected.append(character)
+                if len(collected) > MAX_MESSAGE_CHARS:
+                    too_large = True
+                    collected.clear()
+        if too_large:
+            return PasteReadResult("", too_large=True)
+        return PasteReadResult(sanitize_composer_input("".join(collected)))
+    finally:
+        screen.timeout(100)
+
+
+def run_dashboard(
+    socket: str | None,
+    history_lines: int,
+    interval: float,
+    color_enabled: bool,
+) -> int:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        print("tmuxius requires an interactive terminal", file=sys.stderr)
+        return 2
+
+    def dashboard_loop(screen: curses.window) -> int:
+        try:
+            curses.raw()
+        except curses.error:
+            pass
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        screen.keypad(True)
+        screen.timeout(100)
+        try:
+            curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+            curses.mouseinterval(0)
+        except curses.error:
+            pass
+        try:
+            os.write(sys.stdout.fileno(), b"\x1b[?2004h")
+        except OSError:
+            pass
+        palette = initialize_curses_palette(color_enabled)
+        workspaces: list[Workspace] = []
+        error: str | None = None
+        dashboard_state = DashboardState()
+        send_results: queue.Queue[SendResult] = queue.Queue()
+        next_selected_refresh = 0.0
+        next_background_refresh = 0.0
+        next_detail_refresh = 0.0
+        panes_by_session: dict[str, Pane] = {}
+        monitor_visible = True
+        draw_needed = True
+        # Pane IDs are local to a server; another socket may also have %0.
+        current_socket = os.environ.get("TMUX", "").rsplit(",", 2)[0]
+        current_pane = (
+            os.environ.get("TMUX_PANE")
+            if current_socket and (socket is None or
+                                   Path(socket).resolve() == Path(current_socket).resolve())
+            else None
+        )
+
+        def active_session_id() -> str | None:
+            return dashboard_active_session_id(dashboard_state)
+
+        def displayed_session_ids() -> tuple[str, ...]:
+            return dashboard_displayed_session_ids(dashboard_state)
+
+        def switch_selection(
+            session_id: str | None,
+            announce: bool = False,
+            slot: int | None = None,
+        ) -> None:
+            nonlocal draw_needed, next_selected_refresh
+            target_slot = dashboard_state.active_slot if slot is None else slot
+            target_slot = max(0, min(1, target_slot))
+            current = dashboard_state.selected_session_ids[target_slot]
+            if session_id == current:
+                dashboard_state.selector = ""
+                return
+            if dashboard_state.split_view and session_id is not None:
+                other_slot = 1 - target_slot
+                if dashboard_state.selected_session_ids[other_slot] == session_id:
+                    dashboard_state.selected_session_ids[other_slot] = current
+            dashboard_state.selected_session_ids[target_slot] = session_id
+            if target_slot == dashboard_state.active_slot:
+                activate_workspace_input(dashboard_state, session_id)
+            next_selected_refresh = 0.0
+            dashboard_state.selector = ""
+            if announce and session_id is not None:
+                selected = next(
+                    (
+                        item
+                        for item in workspaces
+                        if item.session.session_id == session_id
+                    ),
+                    None,
+                )
+                if selected:
+                    pane_label = (
+                        "TOP"
+                        if dashboard_state.split_view and target_slot == 0
+                        else "BOTTOM"
+                        if dashboard_state.split_view
+                        else "WORKSPACE"
+                    )
+                    set_dashboard_status(
+                        dashboard_state,
+                        f"SELECTED {pane_label} {safe_label(selected.session.name)}",
+                        "busy_0",
+                        2.0,
+                    )
+            draw_needed = True
+
+        def switch_active_slot(slot: int, announce: bool = False) -> None:
+            nonlocal draw_needed, next_selected_refresh
+            target = 0 if not dashboard_state.split_view else max(0, min(1, slot))
+            if target == dashboard_state.active_slot:
+                return
+            dashboard_state.active_slot = target
+            activate_workspace_input(
+                dashboard_state, dashboard_state.selected_session_ids[target]
+            )
+            dashboard_state.selector = ""
+            next_selected_refresh = 0.0
+            if announce:
+                set_dashboard_status(
+                    dashboard_state,
+                    f"ACTIVE {'TOP' if target == 0 else 'BOTTOM'} PANE",
+                    "busy_0",
+                    2.0,
+                )
+            draw_needed = True
+
+        def toggle_split_view() -> None:
+            nonlocal draw_needed, next_selected_refresh
+            if not dashboard_state.split_view:
+                terminal_height, _ = screen.getmaxyx()
+                if terminal_height < 16:
+                    set_dashboard_status(
+                        dashboard_state,
+                        "STACKED VIEW NEEDS AT LEAST 16 TERMINAL ROWS",
+                        "orange",
+                        4.0,
+                    )
+                    draw_needed = True
+                    return
+                if len(workspaces) < 2:
+                    set_dashboard_status(
+                        dashboard_state,
+                        "STACKED VIEW NEEDS TWO WORKSPACES",
+                        "orange",
+                        3.0,
+                    )
+                    draw_needed = True
+                    return
+                primary = dashboard_state.selected_session_ids[0]
+                secondary = dashboard_state.selected_session_ids[1]
+                available = [
+                    item.session.session_id
+                    for item in workspaces
+                    if item.session.session_id != primary
+                ]
+                if secondary not in available:
+                    secondary = move_workspace_selection(
+                        workspaces, primary, 1
+                    )
+                    if secondary == primary:
+                        secondary = available[0]
+                dashboard_state.selected_session_ids[1] = secondary
+                dashboard_state.split_view = True
+                dashboard_state.active_slot = 0
+                activate_workspace_input(dashboard_state, primary)
+                set_dashboard_status(
+                    dashboard_state,
+                    "STACKED VIEW — TOP PANE ACTIVE",
+                    "busy_0",
+                    3.0,
+                )
+            else:
+                if dashboard_state.active_slot == 1:
+                    (
+                        dashboard_state.selected_session_ids[0],
+                        dashboard_state.selected_session_ids[1],
+                    ) = (
+                        dashboard_state.selected_session_ids[1],
+                        dashboard_state.selected_session_ids[0],
+                    )
+                dashboard_state.split_view = False
+                dashboard_state.active_slot = 0
+                if dashboard_state.focus == "window":
+                    dashboard_state.focus = "nav"
+                activate_workspace_input(
+                    dashboard_state, dashboard_state.selected_session_ids[0]
+                )
+                set_dashboard_status(
+                    dashboard_state,
+                    "ONE-PANEL VIEW",
+                    "busy_0",
+                    3.0,
+                )
+            dashboard_state.selector = ""
+            next_selected_refresh = 0.0
+            draw_needed = True
+
+        def reconcile_selections() -> None:
+            nonlocal next_selected_refresh
+            before = (
+                dashboard_state.split_view,
+                dashboard_state.active_slot,
+                tuple(dashboard_state.selected_session_ids),
+                dashboard_state.active_draft_session,
+            )
+            available = [item.session.session_id for item in workspaces]
+            if not available:
+                dashboard_state.split_view = False
+                dashboard_state.active_slot = 0
+                if dashboard_state.focus == "window":
+                    dashboard_state.focus = "nav"
+                dashboard_state.selected_session_ids[:] = [None, None]
+                if dashboard_state.active_draft_session is not None:
+                    activate_workspace_input(dashboard_state, None)
+                if before != (
+                    dashboard_state.split_view,
+                    dashboard_state.active_slot,
+                    tuple(dashboard_state.selected_session_ids),
+                    dashboard_state.active_draft_session,
+                ):
+                    next_selected_refresh = 0.0
+                return
+            if dashboard_state.split_view and len(available) < 2:
+                dashboard_state.split_view = False
+                dashboard_state.active_slot = 0
+                if dashboard_state.focus == "window":
+                    dashboard_state.focus = "nav"
+            primary = dashboard_state.selected_session_ids[0]
+            if primary not in available:
+                primary = default_workspace_session_id(workspaces) or available[0]
+                dashboard_state.selected_session_ids[0] = primary
+            secondary = dashboard_state.selected_session_ids[1]
+            if secondary not in available or secondary == primary:
+                dashboard_state.selected_session_ids[1] = next(
+                    (candidate for candidate in available if candidate != primary),
+                    primary,
+                )
+            if not dashboard_state.split_view:
+                dashboard_state.active_slot = 0
+                if dashboard_state.focus == "window":
+                    dashboard_state.focus = "nav"
+            active = active_session_id()
+            if dashboard_state.active_draft_session != active:
+                activate_workspace_input(dashboard_state, active)
+            after = (
+                dashboard_state.split_view,
+                dashboard_state.active_slot,
+                tuple(dashboard_state.selected_session_ids),
+                dashboard_state.active_draft_session,
+            )
+            if before != after:
+                next_selected_refresh = 0.0
+
+        def commit_selector(force: bool = False) -> None:
+            nonlocal draw_needed
+            selector = dashboard_state.selector
+            if not selector:
+                return
+            numeric = [item for item in workspaces if item.session.name.isdecimal()]
+            matches = [item for item in numeric if item.session.name.startswith(selector)]
+            exact = next((item for item in matches if item.session.name == selector), None)
+            longer = any(item.session.name != selector for item in matches)
+            if exact and (force or not longer):
+                switch_selection(exact.session.session_id, announce=True)
+                return
+            if not matches or force:
+                set_dashboard_status(
+                    dashboard_state,
+                    f"NO WORKSPACE ID {selector}",
+                    "red",
+                    3.0,
+                )
+                dashboard_state.selector = ""
+                draw_needed = True
+
+        def scroll_context(delta: int) -> None:
+            nonlocal draw_needed
+            selected_session_id = active_session_id()
+            if selected_session_id is None:
+                return
+            context = dashboard_vertical_context(
+                dashboard_state.focus, dashboard_state.split_view
+            )
+            if context == "window":
+                switch_active_slot(0 if delta > 0 else 1, announce=True)
+            elif context == "workspace":
+                switch_selection(
+                    move_workspace_selection(
+                        workspaces, selected_session_id, -1 if delta > 0 else 1
+                    ),
+                    announce=True,
+                )
+            else:
+                current = dashboard_state.preview_scroll.get(selected_session_id, 0)
+                dashboard_state.preview_scroll[selected_session_id] = max(
+                    0, current + delta
+                )
+                draw_needed = True
+
+        def apply_dashboard_paste(paste: PasteReadResult) -> None:
+            nonlocal draw_needed
+            if not paste.complete:
+                dashboard_state.focus = "nav"
+                dashboard_state.selector = ""
+                set_dashboard_status(
+                    dashboard_state,
+                    "PASTE DID NOT CLOSE — NOTHING ADDED — PRESS RIGHT TO RESUME",
+                    "red",
+                    8.0,
+                )
+            elif paste.too_large:
+                set_dashboard_status(
+                    dashboard_state,
+                    (
+                        "PASTE TOO LARGE — 1,048,576 CHARACTER MAX — "
+                        "NOTHING ADDED"
+                    ),
+                    "red",
+                    8.0,
+                )
+            elif not paste.text:
+                set_dashboard_status(
+                    dashboard_state,
+                    "PASTE WAS EMPTY — NOTHING ADDED",
+                    "orange",
+                    4.0,
+                )
+            elif dashboard_state.focus != "compose":
+                set_dashboard_status(
+                    dashboard_state,
+                    "PASTE IGNORED IN CONTROL MODE — SELECT MESSAGE",
+                    "orange",
+                    4.0,
+                )
+            elif dashboard_state.sending:
+                set_dashboard_status(
+                    dashboard_state,
+                    "WAIT FOR THE CURRENT SUBMISSION TO FINISH",
+                    "orange",
+                    4.0,
+                )
+            elif not insert_composer_text(
+                dashboard_state, paste.text, pasted=True
+            ):
+                set_dashboard_status(
+                    dashboard_state,
+                    (
+                        "MESSAGE WOULD EXCEED 1,048,576 CHARACTERS — "
+                        "PASTE NOT ADDED"
+                    ),
+                    "orange",
+                    6.0,
+                )
+            elif len(paste.text) > LARGE_PASTE_CHAR_THRESHOLD:
+                set_dashboard_status(
+                    dashboard_state,
+                    (
+                        f"PASTED {len(paste.text):,} CHARS AS ONE CONTENT BLOCK — "
+                        "ENTER TO SEND"
+                    ),
+                    "green",
+                    5.0,
+                )
+            draw_needed = True
+
+        try:
+            while True:
+                monotonic_now = time.monotonic()
+                if (
+                    dashboard_state.status
+                    and not dashboard_state.sending
+                    and monotonic_now >= dashboard_state.status_until
+                ):
+                    dashboard_state.status = ""
+                    draw_needed = True
+
+                while True:
+                    try:
+                        send_result = send_results.get_nowait()
+                    except queue.Empty:
+                        break
+                    dashboard_state.sending = False
+                    if send_result.ok:
+                        dashboard_state.drafts[send_result.session_id] = ""
+                        dashboard_state.draft_cursors[send_result.session_id] = 0
+                        dashboard_state.draft_paste_payloads[send_result.session_id] = {}
+                        if dashboard_state.active_draft_session == send_result.session_id:
+                            dashboard_state.text = ""
+                            dashboard_state.cursor = 0
+                            dashboard_state.paste_payloads = {}
+                        dashboard_state.preview_scroll[send_result.session_id] = 0
+                        set_dashboard_status(
+                            dashboard_state,
+                            "MESSAGE SUBMITTED EXACTLY — WATCHING FOR RESPONSE",
+                            "green",
+                            6.0,
+                        )
+                        next_selected_refresh = 0.0
+                        next_background_refresh = 0.0
+                    else:
+                        if (
+                            dashboard_state.inflight_session
+                            == send_result.session_id
+                            and dashboard_state.inflight_message
+                        ):
+                            restored = dashboard_state.inflight_draft
+                            restored_payloads = dict(
+                                dashboard_state.inflight_paste_payloads
+                            )
+                            dashboard_state.drafts[send_result.session_id] = restored
+                            dashboard_state.draft_cursors[send_result.session_id] = len(
+                                restored
+                            )
+                            dashboard_state.draft_paste_payloads[
+                                send_result.session_id
+                            ] = restored_payloads
+                            if (
+                                dashboard_state.active_draft_session
+                                == send_result.session_id
+                            ):
+                                dashboard_state.text = restored
+                                dashboard_state.cursor = len(restored)
+                                dashboard_state.paste_payloads = restored_payloads
+                        set_dashboard_status(
+                            dashboard_state,
+                            f"SEND STOPPED — DRAFT RESTORED — {send_result.detail}",
+                            "red",
+                            10.0,
+                        )
+                    dashboard_state.inflight_session = None
+                    dashboard_state.inflight_message = ""
+                    dashboard_state.inflight_draft = ""
+                    dashboard_state.inflight_paste_payloads = {}
+                    draw_needed = True
+
+                if (
+                    dashboard_state.focus == "nav"
+                    and dashboard_state.selector
+                    and monotonic_now - dashboard_state.selector_updated >= 0.7
+                ):
+                    commit_selector(force=True)
+
+                if monotonic_now >= next_background_refresh:
+                    try:
+                        sessions = list_sessions(socket)
+                        live_panes = list_active_panes(socket)
+                        dashboard_session = next(
+                            (
+                                session
+                                for session in sessions
+                                if live_panes.get(session.session_id) is not None
+                                and live_panes[session.session_id].pane_id
+                                == current_pane
+                            ),
+                            None,
+                        )
+                        monitor_visible = (
+                            dashboard_session is None
+                            or dashboard_session.attached > 0
+                        )
+                        visible_sessions = [
+                            session
+                            for session in sessions
+                            if live_panes.get(session.session_id) is None
+                            or live_panes[session.session_id].pane_id != current_pane
+                        ]
+                        live_identity = tuple(
+                            (
+                                session.session_id,
+                                session.name,
+                                live_panes.get(session.session_id).pane_id
+                                if live_panes.get(session.session_id)
+                                else "",
+                            )
+                            for session in visible_sessions
+                        )
+                        cached_identity = tuple(
+                            (
+                                workspace.session.session_id,
+                                workspace.session.name,
+                                workspace.pane_id,
+                            )
+                            for workspace in workspaces
+                        )
+                        if monitor_visible and live_identity != cached_identity:
+                            workspaces = collect_workspaces(
+                                sessions,
+                                socket,
+                                history_lines,
+                                exclude_pane_id=current_pane,
+                            )
+                            next_detail_refresh = (
+                                time.monotonic() + DETAIL_REFRESH_SECONDS
+                            )
+                        elif monitor_visible:
+                            displayed = set(displayed_session_ids())
+                            sessions_by_id = {
+                                session.session_id: session
+                                for session in visible_sessions
+                            }
+                            background_panes = [
+                                live_panes[workspace.session.session_id]
+                                for workspace in workspaces
+                                if workspace.session.session_id not in displayed
+                                and workspace.session.session_id in live_panes
+                            ]
+                            snapshots = capture_snapshots(
+                                socket,
+                                background_panes,
+                                BACKGROUND_HISTORY_LINES,
+                            )
+                            wall_now = time.time()
+                            refreshed: list[Workspace] = []
+                            for workspace in workspaces:
+                                session = sessions_by_id.get(
+                                    workspace.session.session_id,
+                                    workspace.session,
+                                )
+                                pane = live_panes.get(session.session_id)
+                                snapshot = (
+                                    snapshots.get(pane.pane_id)
+                                    if pane is not None
+                                    else None
+                                )
+                                if (
+                                    session.session_id not in displayed
+                                    and snapshot is not None
+                                ):
+                                    updated = refresh_workspace_from_snapshot(
+                                        workspace,
+                                        session,
+                                        snapshot,
+                                        now=wall_now,
+                                        include_preview=False,
+                                    )
+                                    refreshed.append(
+                                        replace(
+                                            updated,
+                                            window_title=(
+                                                explicit_window_subject(pane)
+                                                if pane is not None
+                                                else None
+                                            ),
+                                        )
+                                    )
+                                else:
+                                    refreshed.append(
+                                        replace(
+                                            workspace,
+                                            session=session,
+                                            pane_id=(
+                                                pane.pane_id
+                                                if pane is not None
+                                                else workspace.pane_id
+                                            ),
+                                            window_title=(
+                                                explicit_window_subject(pane)
+                                                if pane is not None
+                                                else None
+                                            ),
+                                        )
+                                    )
+                            workspaces = refreshed
+                        panes_by_session = live_panes
+                        error = None
+                    except TmuxError as exc:
+                        if not workspaces:
+                            error = clean_text(str(exc)) or "unknown tmux error"
+                    reconcile_selections()
+                    next_background_refresh = (
+                        time.monotonic()
+                        + (
+                            BACKGROUND_REFRESH_SECONDS
+                            if monitor_visible
+                            else 2.0
+                        )
+                    )
+                    if monitor_visible:
+                        draw_needed = True
+
+                if (
+                    monitor_visible
+                    and workspaces
+                    and panes_by_session
+                    and monotonic_now >= next_detail_refresh
+                ):
+                    workspaces = refresh_workspace_details(
+                        workspaces, panes_by_session, socket
+                    )
+                    next_detail_refresh = (
+                        time.monotonic() + DETAIL_REFRESH_SECONDS
+                    )
+                    draw_needed = True
+
+                if (
+                    monitor_visible
+                    and workspaces
+                    and displayed_session_ids()
+                    and monotonic_now >= next_selected_refresh
+                ):
+                    selected_panes = [
+                        panes_by_session[session_id]
+                        for session_id in displayed_session_ids()
+                        if session_id in panes_by_session
+                    ]
+                    try:
+                        selected_snapshots = capture_snapshots(
+                            socket, selected_panes, history_lines
+                        )
+                        wall_now = time.time()
+                        displayed = set(displayed_session_ids())
+                        refreshed: list[Workspace] = []
+                        for workspace in workspaces:
+                            if workspace.session.session_id not in displayed:
+                                refreshed.append(workspace)
+                                continue
+                            pane = panes_by_session.get(
+                                workspace.session.session_id
+                            )
+                            snapshot = (
+                                selected_snapshots.get(pane.pane_id)
+                                if pane is not None
+                                else None
+                            )
+                            if snapshot is None:
+                                refreshed.append(workspace)
+                                continue
+                            refreshed.append(
+                                refresh_workspace_from_snapshot(
+                                    workspace,
+                                    workspace.session,
+                                    snapshot,
+                                    now=wall_now,
+                                    include_preview=True,
+                                )
+                            )
+                        workspaces = refreshed
+                    except TmuxError:
+                        # Keep the last good frames. The topology pass handles
+                        # closed or replaced panes without a refresh spin.
+                        pass
+                    next_selected_refresh = time.monotonic() + interval
+                    draw_needed = True
+
+                if draw_needed and monitor_visible:
+                    draw_dashboard(
+                        screen,
+                        workspaces,
+                        dashboard_state,
+                        palette,
+                        interval,
+                        error,
+                        time.time(),
+                    )
+                    draw_needed = False
+
+                try:
+                    key = screen.get_wch()
+                except curses.error:
+                    continue
+
+                if key == curses.KEY_RESIZE:
+                    draw_needed = True
+                    continue
+
+                if key == curses.KEY_MOUSE:
+                    try:
+                        _, mouse_x, mouse_y, _, button_state = curses.getmouse()
+                    except curses.error:
+                        continue
+                    terminal_height, terminal_width = screen.getmaxyx()
+                    usable_width = max(1, terminal_width - 1)
+                    workspace_bottom = dashboard_workspace_bottom(
+                        terminal_height,
+                        len(workspaces),
+                        dashboard_state.split_view,
+                        dashboard_state.workspaces_collapsed,
+                    )
+                    geometries = dashboard_panel_geometries(
+                        usable_width,
+                        terminal_height,
+                        workspace_bottom,
+                        dashboard_state.split_view,
+                        dashboard_state.active_slot,
+                    )
+                    mouse_slot = next(
+                        (
+                            slot
+                            for slot, geometry in enumerate(geometries)
+                            if geometry.x <= mouse_x < geometry.x + geometry.width
+                            and geometry.chat_top
+                            <= mouse_y
+                            <= max(geometry.chat_bottom, geometry.composer_bottom)
+                        ),
+                        dashboard_state.active_slot,
+                    )
+                    if (
+                        dashboard_state.split_view
+                        and mouse_y > workspace_bottom
+                    ):
+                        switch_active_slot(mouse_slot)
+                    if button_state & curses.BUTTON4_PRESSED:
+                        scroll_context(3)
+                    elif button_state & curses.BUTTON5_PRESSED:
+                        scroll_context(-3)
+                    elif button_state & curses.BUTTON1_CLICKED:
+                        active_geometry = geometries[dashboard_state.active_slot]
+                        if (
+                            active_geometry.composer_top
+                            <= mouse_y
+                            <= active_geometry.composer_bottom
+                        ):
+                            clicked_focus = (
+                                dashboard_focus_at_x(
+                                    active_geometry.x,
+                                    dashboard_state.split_view,
+                                    mouse_x,
+                                )
+                                if mouse_y == active_geometry.composer_middle
+                                else None
+                            )
+                            dashboard_state.focus = clicked_focus or "compose"
+                            dashboard_state.selector = ""
+                            draw_needed = True
+                        elif (
+                            active_geometry.chat_top
+                            <= mouse_y
+                            <= active_geometry.chat_bottom
+                        ):
+                            dashboard_state.focus = "nav"
+                            dashboard_state.selector = ""
+                            draw_needed = True
+                    continue
+
+                if key == "\x1b":
+                    pasted = read_bracketed_paste(screen)
+                    if pasted is not None:
+                        dashboard_state.paste_enter_suppress_until = 0.0
+                        apply_dashboard_paste(pasted)
+                        continue
+                    dashboard_state.focus = "nav"
+                    dashboard_state.selector = ""
+                    draw_needed = True
+                    continue
+
+                if not workspaces:
+                    continue
+
+                if dashboard_state.sending:
+                    continue
+
+                burst = read_unbracketed_paste_burst(screen, key)
+                if burst is not None:
+                    dashboard_state.paste_enter_suppress_until = (
+                        time.monotonic() + PASTE_ENTER_SUPPRESS_SECONDS
+                    )
+                    apply_dashboard_paste(burst)
+                    continue
+
+                if dashboard_state.focus in {"window", "nav"}:
+                    if key in ("\t", curses.KEY_BTAB) and dashboard_state.split_view:
+                        switch_active_slot(1 - dashboard_state.active_slot, announce=True)
+                    elif key in (curses.KEY_RIGHT, "\t", curses.KEY_BTAB):
+                        dashboard_state.focus = dashboard_focus_step(
+                            dashboard_state.focus,
+                            dashboard_state.split_view,
+                            1,
+                        )
+                        dashboard_state.selector = ""
+                        draw_needed = True
+                    elif key == curses.KEY_LEFT:
+                        dashboard_state.focus = dashboard_focus_step(
+                            dashboard_state.focus,
+                            dashboard_state.split_view,
+                            -1,
+                        )
+                        dashboard_state.selector = ""
+                        draw_needed = True
+                    elif key == curses.KEY_UP:
+                        scroll_context(3)
+                    elif key == curses.KEY_DOWN:
+                        scroll_context(-3)
+                    elif key in ("q", "Q"):
+                        return 0
+                    elif key in ("s", "S"):
+                        toggle_split_view()
+                    elif key in ("c", "C"):
+                        dashboard_state.workspaces_collapsed = (
+                            not dashboard_state.workspaces_collapsed
+                        )
+                        draw_needed = True
+                    elif key in ("r", "R", "\x0c"):
+                        next_selected_refresh = 0.0
+                        next_background_refresh = 0.0
+                        next_detail_refresh = 0.0
+                    elif (
+                        dashboard_state.focus == "nav"
+                        and key in ("\n", "\r", curses.KEY_ENTER)
+                    ):
+                        if dashboard_state.selector:
+                            commit_selector(force=True)
+                        else:
+                            dashboard_state.focus = "compose"
+                            draw_needed = True
+                    elif (
+                        dashboard_state.focus == "nav"
+                        and key in (curses.KEY_BACKSPACE, "\x7f", "\b")
+                    ):
+                        dashboard_state.selector = dashboard_state.selector[:-1]
+                        dashboard_state.selector_updated = time.monotonic()
+                        draw_needed = True
+                    elif (
+                        dashboard_state.focus == "nav"
+                        and isinstance(key, str)
+                        and key.isdecimal()
+                    ):
+                        dashboard_state.selector = (
+                            dashboard_state.selector + key
+                        )[-12:]
+                        dashboard_state.selector_updated = time.monotonic()
+                        commit_selector(force=False)
+                        draw_needed = True
+                    continue
+
+                if key in ("\t", curses.KEY_BTAB):
+                    if dashboard_state.split_view:
+                        switch_active_slot(1 - dashboard_state.active_slot, announce=True)
+                    else:
+                        dashboard_state.focus = "nav"
+                        dashboard_state.selector = ""
+                        draw_needed = True
+                elif key == curses.KEY_LEFT:
+                    if dashboard_state.cursor > 0:
+                        dashboard_state.cursor -= 1
+                    else:
+                        dashboard_state.focus = dashboard_focus_step(
+                            dashboard_state.focus,
+                            dashboard_state.split_view,
+                            -1,
+                        )
+                        dashboard_state.selector = ""
+                    draw_needed = True
+                elif key == curses.KEY_RIGHT:
+                    dashboard_state.cursor = min(
+                        len(dashboard_state.text), dashboard_state.cursor + 1
+                    )
+                    draw_needed = True
+                elif key == curses.KEY_HOME or key == "\x01":
+                    dashboard_state.cursor = 0
+                    draw_needed = True
+                elif key == curses.KEY_END or key == "\x05":
+                    dashboard_state.cursor = len(dashboard_state.text)
+                    draw_needed = True
+                elif key == curses.KEY_UP:
+                    scroll_context(3)
+                elif key == curses.KEY_DOWN:
+                    scroll_context(-3)
+                elif key == curses.KEY_PPAGE:
+                    scroll_context(10)
+                elif key == curses.KEY_NPAGE:
+                    scroll_context(-10)
+                elif key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                    if dashboard_state.cursor > 0:
+                        dashboard_state.text = (
+                            dashboard_state.text[: dashboard_state.cursor - 1]
+                            + dashboard_state.text[dashboard_state.cursor :]
+                        )
+                        dashboard_state.cursor -= 1
+                        purge_orphaned_pastes(dashboard_state)
+                        draw_needed = True
+                elif key == curses.KEY_DC or key == "\x04":
+                    if dashboard_state.cursor < len(dashboard_state.text):
+                        dashboard_state.text = (
+                            dashboard_state.text[: dashboard_state.cursor]
+                            + dashboard_state.text[dashboard_state.cursor + 1 :]
+                        )
+                        purge_orphaned_pastes(dashboard_state)
+                        draw_needed = True
+                elif key == "\x15":
+                    dashboard_state.text = dashboard_state.text[dashboard_state.cursor :]
+                    dashboard_state.cursor = 0
+                    purge_orphaned_pastes(dashboard_state)
+                    draw_needed = True
+                elif key == "\x0b":
+                    dashboard_state.text = dashboard_state.text[: dashboard_state.cursor]
+                    purge_orphaned_pastes(dashboard_state)
+                    draw_needed = True
+                elif key == "\x17":
+                    delete_previous_word(dashboard_state)
+                    draw_needed = True
+                elif key == "\x03":
+                    dashboard_state.text = ""
+                    dashboard_state.cursor = 0
+                    dashboard_state.paste_payloads = {}
+                    set_dashboard_status(
+                        dashboard_state, "DRAFT CLEARED", "dim", 2.0
+                    )
+                    draw_needed = True
+                elif key in ("\n", "\r", curses.KEY_ENTER):
+                    if (
+                        time.monotonic()
+                        <= dashboard_state.paste_enter_suppress_until
+                    ):
+                        insert_composer_text(dashboard_state, "\n")
+                        dashboard_state.paste_enter_suppress_until = (
+                            time.monotonic() + PASTE_ENTER_SUPPRESS_SECONDS
+                        )
+                        draw_needed = True
+                        continue
+                    dashboard_state.paste_enter_suppress_until = 0.0
+                    message = outbound_composer_message(
+                        dashboard_state.text, dashboard_state.paste_payloads
+                    )
+                    if not message.strip():
+                        set_dashboard_status(
+                            dashboard_state,
+                            "TYPE A MESSAGE BEFORE SENDING",
+                            "orange",
+                            3.0,
+                        )
+                        draw_needed = True
+                        continue
+                    selected_session_id = active_session_id()
+                    if selected_session_id is None:
+                        set_dashboard_status(
+                            dashboard_state,
+                            "NO ACTIVE WORKSPACE",
+                            "red",
+                            3.0,
+                        )
+                        draw_needed = True
+                        continue
+                    selected = workspaces[
+                        selected_workspace_index(workspaces, selected_session_id)
+                    ]
+                    if selected.app not in {"Codex", "Claude"} or not selected.pane_id:
+                        set_dashboard_status(
+                            dashboard_state,
+                            "SELECTED PANE HAS NO VERIFIED CHAT COMPOSER",
+                            "red",
+                            5.0,
+                        )
+                        draw_needed = True
+                        continue
+                    dashboard_state.sending = True
+                    dashboard_state.inflight_session = selected.session.session_id
+                    dashboard_state.inflight_message = message
+                    dashboard_state.inflight_draft = dashboard_state.text
+                    dashboard_state.inflight_paste_payloads = dict(
+                        dashboard_state.paste_payloads
+                    )
+                    dashboard_state.drafts[selected.session.session_id] = ""
+                    dashboard_state.draft_cursors[selected.session.session_id] = 0
+                    dashboard_state.draft_paste_payloads[
+                        selected.session.session_id
+                    ] = {}
+                    dashboard_state.text = ""
+                    dashboard_state.cursor = 0
+                    dashboard_state.paste_payloads = {}
+                    set_dashboard_status(
+                        dashboard_state,
+                        f"VERIFYING SUBMISSION TO {safe_label(selected.session.name)}…",
+                        "busy_2",
+                        30.0,
+                    )
+                    threading.Thread(
+                        target=submit_dashboard_message,
+                        args=(socket, selected, message, send_results),
+                        daemon=True,
+                    ).start()
+                    draw_needed = True
+                elif isinstance(key, str) and key.isprintable():
+                    if not insert_composer_text(dashboard_state, key):
+                        set_dashboard_status(
+                            dashboard_state,
+                            "MESSAGE LIMIT REACHED",
+                            "orange",
+                            3.0,
+                        )
+                    draw_needed = True
+        finally:
+            try:
+                curses.mousemask(0)
+            except curses.error:
+                pass
+            try:
+                os.write(sys.stdout.fileno(), b"\x1b[?2004l")
+            except OSError:
+                pass
+
+    try:
+        return curses.wrapper(dashboard_loop)
+    except curses.error as exc:
+        print(f"tmuxius could not initialize the terminal: {exc}", file=sys.stderr)
+        return 2
+
+
+def self_test() -> None:
+    snapshot = """
+• A useful earlier status that should not win.
+• Ran printf 'not a summary'
+› Run /review on my current changes
+• The scheduler fix is merged and final verification is running now.
+"""
+    assert transcript_summary(snapshot) == (
+        "The scheduler fix is merged and final verification is running now."
+    )
+    assert transcript_summary("› Please finish the local login display\n") == (
+        "Please finish the local login display"
+    )
+    assert transcript_summary("• api_key=do-not-print-this-value\n") == (
+        "No safe recent summary available"
+    )
+    assert transcript_summary("• The token is abc123 and must stay private.\n") == (
+        "No safe recent summary available"
+    )
+    assert work_state("◦ Working (6s • esc to interrupt)") == "busy"
+    assert work_state(
+        "Working (6s • esc to interrupt) · 1 background terminal running · /ps to vie…"
+    ) == "busy"
+    assert work_state("An old esc to interrupt mention is only prose.\n› \n") == "ready"
+    assert work_state("• Documenting what Computing means.\n› \n") == "ready"
+    assert work_state("✻ Sautéing… (12s · esc to interrupt)\n❯ \n") == "busy"
+    assert work_state("› \n") == "ready"
+    assert busy_duration("Working (4s • esc to interrupt)") == 4
+    assert busy_duration("Computing (1h 2m 3s • esc to interrupt)") == 3723
+    assert busy_duration("ready") is None
+    assert semantic_snapshot_signature(
+        "Working (4s • esc to interrupt)\n"
+    ) == semantic_snapshot_signature("Working (1m 9s • esc to interrupt)\n")
+    assert semantic_snapshot_signature("› first\n") != semantic_snapshot_signature(
+        "› second\n"
+    )
+    assert activity_tier(9_500, "ready", now=10_000) == "green"
+    assert activity_tier(9_400, "ready", now=10_000) == "green"
+    assert activity_tier(9_399, "ready", now=10_000) == "recent"
+    assert activity_tier(8_201, "ready", now=10_000) == "recent"
+    assert activity_tier(8_200, "ready", now=10_000) == "orange"
+    assert activity_tier(6_400, "ready", now=10_000) == "orange"
+    assert activity_tier(6_399, "ready", now=10_000) == "complete"
+    assert activity_tier(1, "busy", now=10_000) == "busy"
+    assert activity_tier(None, "ready", now=10_000) == "unknown"
+    assert lifecycle_label("busy", "busy") == "busy"
+    assert lifecycle_label("ready", "green") == "ready"
+    assert lifecycle_label("ready", "recent") == "ready"
+    assert lifecycle_label("ready", "orange") == "finishing"
+    assert lifecycle_label("ready", "complete") == "complete"
+    assert format_elapsed(4) == "4s"
+    assert format_elapsed(65) == "1m05s"
+    assert format_elapsed(3723) == "1h02m"
+    assert format_activity_age(9_998, now=10_000) == "now"
+    assert format_activity_age(9_300, now=10_000) == "11m40s"
+    assert clean_text("hello\x1b[31m red\x1b[0m\x07") == "hello red"
+    composed = '/review 123 q r j k $HOME @file "quoted"'
+    assert sanitize_composer_input(composed) == composed
+    assert sanitize_composer_input(
+        "first\r\nsecond\x1b[31m red\x1b[0m\x00\tend"
+    ) == "first\nsecond red\tend"
+    assert outbound_composer_message("line one\nline two\n") == (
+        "line one\nline two\n"
+    )
+    draft_state = DashboardState()
+    draft_state.selected_session_ids[:] = ["$1", "$2"]
+    activate_workspace_input(draft_state, "$1")
+    assert insert_composer_text(draft_state, "/review one")
+    activate_workspace_input(draft_state, "$2")
+    assert draft_state.text == ""
+    assert insert_composer_text(draft_state, "workspace two")
+    activate_workspace_input(draft_state, "$1")
+    assert draft_state.text == "/review one"
+    assert draft_state.cursor == len("/review one")
+    large_paste = "paste line\n" + "x" * 1_001
+    assert insert_composer_text(draft_state, large_paste, pasted=True)
+    paste_token = draft_state.text[-1]
+    assert is_paste_token(paste_token)
+    assert render_composer_text(paste_token, draft_state.paste_payloads) == (
+        f"[Pasted Content {len(large_paste)} chars]"
+    )
+    assert outbound_composer_message(
+        draft_state.text, draft_state.paste_payloads
+    ) == "/review one" + large_paste
+    activate_workspace_input(draft_state, "$2")
+    activate_workspace_input(draft_state, "$1")
+    assert draft_state.paste_payloads[paste_token] == large_paste
+    too_large_state = DashboardState()
+    assert not insert_composer_text(
+        too_large_state, "x" * (MAX_MESSAGE_CHARS + 1), pasted=True
+    )
+    assert too_large_state.text == "" and not too_large_state.paste_payloads
+    assert dashboard_active_session_id(draft_state) == "$1"
+    assert dashboard_displayed_session_ids(draft_state) == ("$1",)
+    draft_state.split_view = True
+    draft_state.active_slot = 1
+    assert dashboard_active_session_id(draft_state) == "$2"
+    assert dashboard_displayed_session_ids(draft_state) == ("$1", "$2")
+    assert dashboard_focus_modes(False) == ("nav", "compose")
+    assert dashboard_focus_modes(True) == ("window", "nav", "compose")
+    assert dashboard_focus_step("compose", True, -1) == "nav"
+    assert dashboard_focus_step("nav", True, -1) == "window"
+    assert dashboard_focus_step("window", True, 1) == "nav"
+    assert dashboard_focus_step("nav", True, 1) == "compose"
+    assert dashboard_focus_step("nav", False, -1) == "nav"
+    assert dashboard_focus_step("nav", False, 1) == "compose"
+    assert dashboard_vertical_context("window", True) == "window"
+    assert dashboard_vertical_context("nav", True) == "workspace"
+    assert dashboard_vertical_context("compose", True) == "preview"
+    assert dashboard_vertical_context("nav", False) == "workspace"
+    chip_ranges = dashboard_focus_chip_ranges(0, True)
+    assert chip_ranges == (
+        ("window", 1, 9),
+        ("nav", 10, 21),
+        ("compose", 22, 31),
+    )
+    assert dashboard_focus_at_x(0, True, 3) == "window"
+    assert dashboard_focus_at_x(0, True, 12) == "nav"
+    assert dashboard_focus_at_x(0, True, 24) == "compose"
+    assert dashboard_focus_at_x(0, True, 9) is None
+    one_geometry = dashboard_panel_geometries(80, 40, 11, False)
+    assert one_geometry == (
+        DashboardPanelGeometry(0, 80, 12, 37, 38, 38, 38),
+    )
+    stacked_geometry = dashboard_panel_geometries(80, 40, 11, True)
+    assert stacked_geometry == (
+        DashboardPanelGeometry(0, 80, 12, 23, 24, 24, 24),
+        DashboardPanelGeometry(0, 80, 26, 38, -1, -1, -1),
+    )
+    assert dashboard_workspace_bottom(40, 7) == 10
+    assert dashboard_workspace_bottom(22, 7, True) == 10
+
+    class FakePasteScreen:
+        def __init__(self, events: str) -> None:
+            self.events = list(events)
+
+        def timeout(self, _milliseconds: int) -> None:
+            return None
+
+        def get_wch(self) -> str:
+            if not self.events:
+                raise curses.error("empty")
+            return self.events.pop(0)
+
+    bracketed = read_bracketed_paste(
+        FakePasteScreen("[200~first\nsecond\n\x1b[201~")
+    )
+    assert bracketed == PasteReadResult("first\nsecond\n")
+    burst = read_unbracketed_paste_burst(
+        FakePasteScreen("apid burst\nsecond line"), "r"
+    )
+    assert burst == PasteReadResult("rapid burst\nsecond line")
+    assert safe_summary("new skills", min_length=3) == "new skills"
+    assert safe_preview_lines("› hello\n  continued\n• Working (4s)\n") == (
+        PreviewLine("› hello continued", "user"),
+        PreviewLine("• Working (4s)", "working"),
+    )
+    responsive_preview = safe_preview_lines(
+        "• A paragraph rendered in a narrow phone window\n"
+        "  continues across several physical terminal rows\n"
+        "  before the thought is complete.\n"
+        "\n"
+        "  - Keep list structure\n"
+        "  1. Keep numbered structure\n"
+    )
+    assert responsive_preview == (
+        PreviewLine(
+            "• A paragraph rendered in a narrow phone window continues across "
+            "several physical terminal rows before the thought is complete.",
+            "assistant",
+        ),
+        PreviewLine("", "blank"),
+        PreviewLine("  - Keep list structure", "assistant"),
+        PreviewLine("  1. Keep numbered structure", "assistant"),
+    )
+    responsive_rows, _, _ = preview_window(responsive_preview, 72, 10)
+    assert all(display_width(line.text) <= 72 for line in responsive_rows)
+    responsive_layout = wrap_preview_lines(responsive_preview, 72)
+    assert preview_window_from_wrapped(responsive_layout, 10) == preview_window(
+        responsive_preview, 72, 10
+    )
+    long_preview = safe_preview_lines(
+        "\n".join(f"› retained line {index}" for index in range(300))
+    )
+    assert len(long_preview) == 300
+    assert long_preview[0].text == "› retained line 0"
+    assert len(
+        safe_preview_lines(
+            "\n".join(f"› retained line {index}" for index in range(300)),
+            limit=10,
+        )
+    ) == 10
+    assert capture_start_line(0) == "-"
+    assert capture_start_line(260) == "-260"
+    assert safe_preview_lines("› Explain this codebase\n") == ()
+    assert safe_preview_lines("› Implement {feature}\n") == ()
+    assert safe_preview_lines("api_key=do-not-show\n") == (
+        PreviewLine("api_key=do-not-show", "body"),
+    )
+    styled_preview = safe_preview_lines(
+        "\x1b[2m• \x1b[0mUse \x1b[1mone shared vault\x1b[0m with an "
+        "\x1b[4m\x1b[38;5;6mhttps://example.com\x1b[0m link.\n"
+        "  Keep \x1b[3memphasis\x1b[0m after visual reflow.\n"
+    )
+    assert len(styled_preview) == 1
+    styled_line = styled_preview[0]
+    assert styled_line.text == (
+        "• Use one shared vault with an https://example.com link. "
+        "Keep emphasis after visual reflow."
+    )
+    assert preview_style_at(styled_line, 0).dim
+    assert preview_style_at(styled_line, styled_line.text.index("one")).bold
+    link_style = preview_style_at(
+        styled_line, styled_line.text.index("https://")
+    )
+    assert link_style.underline and link_style.foreground == 6
+    assert preview_style_at(
+        styled_line, styled_line.text.index("emphasis")
+    ).italic
+    styled_rows = wrap_preview_line(styled_line, 36)
+    assert len(styled_rows) >= 2
+    assert all(row.spans for row in styled_rows)
+    assert " ".join(row.text.strip() for row in styled_rows) == styled_line.text
+    table_header = safe_preview_lines(
+        "\x1b[1m\x1b[38;2;249;226;175m Option  Best use  Verdict\n"
+    )[0]
+    header_style = preview_style_at(table_header, table_header.text.index("Option"))
+    assert header_style.bold
+    assert header_style.foreground == (249, 226, 175)
+    assert nearest_terminal_color(6, 256) == 6
+    assert xterm_color_rgb(6) == (0, 128, 128)
+    assert semantic_snapshot_signature("plain text") == semantic_snapshot_signature(
+        "\x1b[1mplain\x1b[0m text"
+    )
+    assert preview_snapshot_signature("plain text") != preview_snapshot_signature(
+        "\x1b[1mplain\x1b[0m text"
+    )
+    busy_tick_one = "\x1b[38;5;12m• Working (1s · esc to interrupt)\x1b[0m"
+    busy_tick_two = "\x1b[38;5;5m• Working (2s · esc to interrupt)\x1b[0m"
+    assert preview_snapshot_signature(busy_tick_one) != preview_snapshot_signature(
+        busy_tick_two
+    )
+    stable_snapshot = "• Stable styled response\n\n› Ask anything\n"
+    stable_preview = safe_preview_lines(stable_snapshot)
+    stable_signature = semantic_snapshot_signature(stable_snapshot)
+    stable_workspace = Workspace(
+        Session("$1", "1", 1, 0),
+        "%1",
+        "Codex",
+        "ready",
+        "Stable",
+        0,
+        None,
+        stable_preview,
+        stable_signature,
+        preview_signature=preview_snapshot_signature(stable_snapshot),
+    )
+    stable_refresh = refresh_workspace_from_snapshot(
+        stable_workspace,
+        stable_workspace.session,
+        stable_snapshot,
+        now=1,
+        include_preview=True,
+    )
+    assert stable_refresh.preview is stable_preview
+    changed_refresh = refresh_workspace_from_snapshot(
+        stable_workspace,
+        stable_workspace.session,
+        "• Changed styled response\n\n› Ask anything\n",
+        now=2,
+        include_preview=True,
+    )
+    assert changed_refresh.preview is not stable_preview
+    assert safe_preview_lines("• Ran command\n  │ output\n  └ PASS\n") == (
+        PreviewLine("• Ran command", "tool"),
+        PreviewLine("  │ output", "tool"),
+        PreviewLine("  └ PASS", "tool"),
+    )
+    assert safe_preview_lines("• Ran diff\n19 +new\n20 -old\n") == (
+        PreviewLine("• Ran diff", "tool"),
+        PreviewLine("19 +new", "addition"),
+        PreviewLine("20 -old", "deletion"),
+    )
+    cropped = wrapped_preview(
+        (PreviewLine("• " + "word " * 30, "assistant"),), 20, 3
+    )
+    assert cropped[0] == PreviewLine("… earlier transcript", "meta")
+    assert cropped[1].text.startswith("... ") and not cropped[1].continuation
+    assert display_width("abc") == 3
+    assert display_width("●") == 2
+    assert display_width("界") == 2
+    assert display_width("e\N{COMBINING ACUTE ACCENT}") == 1
+    assert truncate_display("abcdefgh", 7) == "abcd..."
+    assert display_width(truncate_display("ab●cdef", 6)) <= 6
+    assert display_width(display_field("●", 4)) == 4
+    assert thread_ref_from_rollout_path(
+        "/home/example/.codex/sessions/2026/09/01/"
+        "rollout-2026-09-01T00-00-00-00000000-0000-4000-8000-000000000001.jsonl"
+    ) == (
+        "/home/example/.codex",
+        "00000000-0000-4000-8000-000000000001",
+        "/home/example/.codex/sessions/2026/09/01/"
+        "rollout-2026-09-01T00-00-00-00000000-0000-4000-8000-000000000001.jsonl",
+    )
+    automatic_pane = Pane("0", "0", "%1", "node", 1, "codex", True)
+    renamed_pane = Pane("0", "0", "%1", "node", 1, "frontend", False)
+    assert explicit_window_subject(automatic_pane) is None
+    assert explicit_window_subject(renamed_pane) == "frontend"
+    renamed_workspace = Workspace(
+        Session("$1", "5", 0, 0),
+        "%1",
+        "Codex",
+        "ready",
+        "Codex fallback title",
+        0,
+        None,
+        (),
+        window_title="frontend",
+    )
+    assert workspace_subject(renamed_workspace) == "frontend"
+    cached_pane = Pane(
+        "0",
+        "0",
+        "%1",
+        "node",
+        1,
+        "codex",
+        True,
+        json.dumps({"01a00000-0000-0000-0000-000000000000": "Invoice"}),
+    )
+    assert retained_codex_name(
+        cached_pane, "01a00000-0000-0000-0000-000000000000", None
+    ) == "Invoice"
+    assert retained_codex_name(
+        cached_pane, "01a00000-0000-0000-0000-000000000000", "New name"
+    ) == "New name"
+    assert retained_codex_name(
+        cached_pane, "01a00000-0000-0000-0000-000000000001", None
+    ) is None
+    malformed_cache_pane = replace(cached_pane, codex_name_cache="not json")
+    assert retained_codex_names(malformed_cache_pane) == {}
+    parent_title = codex_title_candidate(
+        "frontend", "main prompt", "main prompt", "user", 10
+    )
+    child_title = codex_title_candidate(
+        "child audit", "child prompt", "child prompt", "subagent", 20
+    )
+    assert parent_title is not None and child_title is not None
+    assert max((parent_title, child_title), key=lambda item: item[0])[1] == "frontend"
+    retained_title = codex_title_candidate(
+        None, "generated prompt", "generated prompt", "user", 10, "Invoice"
+    )
+    assert retained_title is not None and retained_title[1] == "Invoice"
+    ordered = sorted(
+        [Session("$1", "10", 0, 0), Session("$2", "2", 0, 0), Session("$3", "alpha", 0, 0)],
+        key=session_sort_key,
+    )
+    assert [session.name for session in ordered] == ["2", "10", "alpha"]
+    candidates = [
+        Workspace(Session("$1", "0", 0, 0), "%1", "Codex", "busy", "A", 300, 2, ()),
+        Workspace(Session("$2", "1", 1, 0), "%2", "Codex", "ready", "B", 400, None, ()),
+        Workspace(Session("$3", "2", 1, 0), "%3", "Codex", "busy", "C", 200, 8, ()),
+    ]
+    assert default_workspace_session_id(candidates) == "$3"
+    print("tmuxius self-test: ok")
+
+
+def main() -> int:
+    args = parse_args()
+    if args.self_test:
+        self_test()
+        return 0
+
+    enabled = sys.stdout.isatty() and not args.no_color and "NO_COLOR" not in os.environ
+    if args.watch:
+        return run_dashboard(args.socket, args.history_lines, args.interval, enabled)
+
+    colors = Colors(enabled)
+    try:
+        sessions = list_sessions(args.socket)
+    except TmuxError as exc:
+        detail = str(exc).casefold()
+        if any(
+            marker in detail
+            for marker in ("no server running", "no sessions", "cannot connect", "error connecting")
+        ):
+            print(f"\n{colors.bold}tmux workspaces{colors.reset}  {colors.dim}none open{colors.reset}\n")
+            return 0
+        print(f"\n{colors.bold}tmux workspaces{colors.reset}  {colors.dim}unavailable{colors.reset}\n")
+        return 0
+
+    if not sessions:
+        print(f"\n{colors.bold}tmux workspaces{colors.reset}  {colors.dim}none open{colors.reset}\n")
+        return 0
+    try:
+        print_report(sessions, args.socket, args.history_lines, colors)
+    except TmuxError:
+        print(f"\n{colors.bold}tmux workspaces{colors.reset}  {colors.dim}unavailable{colors.reset}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
