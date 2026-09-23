@@ -2,8 +2,12 @@
 
 This is a public source tree. Keep all examples and fixtures fictional. Never
 copy host configuration, credentials, deployment records, runtime transcripts,
-user uploads, or private repository history into it. Use the demo to generate
-screenshots. Review new files and add them explicitly to `public-files.txt`.
+unreviewed user uploads, or private repository history into it. Use the demo for
+fictional UI reproductions. An owner-provided real screenshot may be published
+only at the owner's explicit direction, after visual review, opaque privacy
+redactions, and metadata removal. Preserve its original pixels outside the
+redactions and never commit the original. Review new files and add them
+explicitly to `public-files.txt`.
 
 Preserve keyboard navigation, narrow layouts, panel identity colors, and draft
 safety. The installer must not edit Codex, Claude, shell, or tmux configuration.

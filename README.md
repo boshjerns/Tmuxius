@@ -6,10 +6,12 @@ See multiple agents, keep their subjects visible, scroll through their context,
 and send a message when you need to. Runs in your terminal over SSH, with one
 full-height conversation or two stacked conversations.
 
-![Tmuxius in a portrait terminal: workspace list above purple TOP and amber BOTTOM conversations, with controls on the active panel.](docs/assets/stacked.png)
+![Real iPad screenshot of the dashboard: workspace list above purple TOP and amber BOTTOM panels, with private content covered.](docs/assets/ipad.png)
 
-*The actual Tmuxius renderer at tablet-like terminal dimensions. All sessions and
-conversation text in these screenshots are fictional.*
+*A real screenshot from my iPad workflow. The header shows the earlier
+"CODEX HEADS-UP" name. Unrelated session subjects and the lower conversation
+are covered for privacy; device chrome and image metadata are removed.
+The visible interface and conversation are unchanged.*
 
 ## Why I made this
 
@@ -148,8 +150,6 @@ These letter shortcuts are case-insensitive. **In Message, C, S, R, and Q type
 ordinary text.** Only the selected panel shows the control/composer row, and the
 highlighted mode chip tells you what the arrows will do.
 
-![Collapsed workspace list gives more space to both conversations; the bottom panel owns the only control row.](docs/assets/collapsed.png)
-
 **On iPad:** use your SSH terminal's mouse/scroll reporting and gesture mappings.
 Swipes work when the terminal translates them into scroll or arrow-key events;
 Tmuxius does not receive raw touch gestures. If a swipe scrolls the terminal
@@ -181,10 +181,11 @@ reads local tmux output and, for Codex subject enrichment on Linux, local proces
 metadata and Codex's SQLite thread metadata. Messages you explicitly submit are
 handled by the selected agent and its own provider settings.
 
-**Your live dashboard can contain private terminal content.** Its heuristic
-filtering is not a guarantee that screenshots are safe to share. Use the
-fictional demo for public examples. Read [SECURITY.md](SECURITY.md) for the trust
-model and [CONTRIBUTING.md](CONTRIBUTING.md) for tests and publication checks.
+**Your live dashboard can contain private terminal content.** Conversation
+panels do not redact secrets. Use the fictional demo when reporting UI issues,
+or review and redact a real screenshot before sharing it. Read
+[SECURITY.md](SECURITY.md) for the trust model and [CONTRIBUTING.md](CONTRIBUTING.md)
+for tests and publication checks.
 
 MIT licensed. Contributions for other agent interfaces and terminal clients are
 welcome, especially with small, synthetic reproductions.

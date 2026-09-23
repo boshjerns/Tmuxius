@@ -8,6 +8,7 @@ from PIL import Image, ImageDraw, ImageFont
 import pyte
 
 ROOT = Path(__file__).resolve().parents[1]
+OUTPUT = ROOT / "local/demo-screenshots"
 sys.path.insert(0, str(ROOT / "tests"))
 from tmux_harness import DemoTerminal
 
@@ -45,7 +46,8 @@ def save(terminal, name):
             draw.text((left, top + 1), cell.data, font=BOLD if cell.bold else REGULAR, fill=foreground)
             if cell.underscore:
                 draw.line((left, top + CELL_H - 3, left + CELL_W - 1, top + CELL_H - 3), fill=foreground)
-    target = ROOT / "docs/assets" / name
+    OUTPUT.mkdir(parents=True, exist_ok=True)
+    target = OUTPUT / name
     image.save(target, optimize=True)  # No source image or device metadata.
     print(target.relative_to(ROOT))
 
