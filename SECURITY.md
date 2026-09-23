@@ -26,14 +26,22 @@ sends text after you explicitly submit it.
 
 ## Sharing screenshots and examples
 
-Heuristic filtering hides some suspicious summaries and transcript lines. It is
-**not a secret scanner or a complete redaction system**. Names, paths, customer
-details, source code, and credentials may still be visible in a live dashboard.
-Do not publish a real session capture without reviewing every visible character.
+Heuristic filtering applies to workspace subjects and summaries. **Conversation
+panels do not redact secrets.** Names, paths, customer details, source code, and
+credentials may be visible in a live dashboard. Do not publish a real session
+capture without reviewing every visible character.
 
-The public screenshots are rendered from `examples/demo.py`, using fictional
-workspaces. The example disables real tmux access and message submission. Do not
-replace its data with actual transcripts. Use it to reproduce UI issues safely.
+The README uses an owner-provided real screenshot, with unrelated session
+subjects and the lower conversation covered by opaque masks. Device chrome and
+image metadata are removed. Pixels outside the masks are preserved; the image
+is not a generated reconstruction. Never commit the unredacted original or its
+metadata. New real screenshots require the owner's explicit direction and the
+same review before upload.
+
+Use `examples/demo.py` for fictional reproductions of UI issues. The example
+disables real tmux access and message submission. Do not replace its data with
+actual transcripts. The optional renderer writes to `local/demo-screenshots/`,
+outside the published assets.
 
 ## Reporting a vulnerability
 
@@ -53,5 +61,6 @@ with `git config core.hooksPath .githooks` to run them before uploading commits.
 The file manifest rejects unexpected committed files; add intentional public
 files explicitly and review their contents. Secret scanners cannot identify
 every sensitive value, and CI runs after upload. Local checks and human review
-are required before publication. Use synthetic images and fixtures, public
-commit identities, and no runtime captures.
+are required before publication. Keep fixtures fictional and use public commit
+identities. The reviewed screenshot exception above does not authorize runtime
+logs, raw captures, or other private artifacts.

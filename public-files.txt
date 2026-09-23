@@ -7,8 +7,7 @@ CONTRIBUTING.md
 LICENSE
 README.md
 SECURITY.md
-docs/assets/collapsed.png
-docs/assets/stacked.png
+docs/assets/ipad.png
 docs/navigation.md
 examples/demo.py
 install.sh
@@ -19,6 +18,7 @@ scripts/install-gitleaks-ci.sh
 scripts/screenshots-requirements.txt
 scripts/screenshots.py
 tests/test_refresh.py
+tests/test_publication.py
 tests/test_terminal.py
 tests/test_tmux_communication.py
 tests/tmux_harness.py

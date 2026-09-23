@@ -15,8 +15,9 @@ python3 scripts/check-publication.py
 ```
 
 The interactive test launches only disposable tmux servers with fictional
-content. It never attaches to an existing user's server. To regenerate the
-documentation images, install the optional development dependencies in a venv:
+content. It never attaches to an existing user's server. To render fictional
+demo images for local UI checks, install the optional development dependencies
+in a venv:
 
 ```sh
 python3 -m venv .venv
@@ -25,7 +26,10 @@ python3 -m venv .venv
 ```
 
 The renderer uses Liberation Mono; install `fonts-liberation` on Debian/Ubuntu.
-Review the generated images as well as the source fixture.
+It writes to the ignored `local/demo-screenshots/` directory and does not replace
+the real README screenshot. Review generated images as well as the source
+fixture. Real screenshots require the owner's explicit direction, visual review,
+opaque privacy redactions, and metadata removal; never commit the original.
 
 Install [Gitleaks](https://github.com/gitleaks/gitleaks) and enable the local
 publication guard before pushing:
